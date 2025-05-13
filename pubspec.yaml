@@ -18,6 +18,10 @@ dev_dependencies:
     sdk: flutter
   build_runner: ^2.1.7
   json_serializable: ^6.1.4
+  integration_test:
+    sdk: flutter
+  flutter_driver:
+    sdk: flutter
 
 flutter:
   plugin:
