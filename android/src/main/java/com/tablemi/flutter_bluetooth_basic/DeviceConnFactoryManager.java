@@ -113,6 +113,7 @@ public class DeviceConnFactoryManager {
     public static final int CONN_STATE_CONNECTED = CONN_STATE_DISCONNECT << 3;
     public PrinterReader reader;
     private int queryPrinterCommandFlag;
+    private volatile boolean isDisconnecting = false; // Flag to track disconnection state
     private final int ESC = 1;
     private final int TSC = 3;
     private final int CPCL = 2;
@@ -253,6 +254,7 @@ public class DeviceConnFactoryManager {
      */
     public void closePort(int id) {
         if (this.mPort != null) {
+            isDisconnecting = true; // Set flag before closing
             if(reader!=null) {
                 reader.cancel();
                 reader = null;
@@ -263,6 +265,7 @@ public class DeviceConnFactoryManager {
                 isOpenPort = false;
                 currentPrinterCommand = null;
             }
+            isDisconnecting = false; // Reset flag after closing
         }
 
     }
@@ -410,14 +413,23 @@ public class DeviceConnFactoryManager {
     }
     public int readDataImmediately(byte[] buffer){
         int r = 0;
-        if (this.mPort == null) {
-            return r;
+        if (this.mPort == null || !isOpenPort || isDisconnecting) {
+            return -1; // Signal that port is closed or disconnecting
         }
 
         try {
+            // Double-check the flag right before the call
+            if (isDisconnecting) {
+                return -1;
+            }
             r =  this.mPort.readData(buffer);
         } catch (IOException e) {
-
+            // Suppress expected disconnection errors
+            if (e.getMessage() != null && e.getMessage().contains("bt socket closed")) {
+                return -1; // Silent return for expected disconnection
+            }
+            Log.d(TAG, "Bluetooth read error: " + e.getMessage());
+            return -1; // Signal connection lost
         }
 
         return  r;
@@ -427,63 +439,16 @@ public class DeviceConnFactoryManager {
      * 查询打印机当前使用的指令（ESC、CPCL、TSC、）
      */
     private void queryPrinterCommand() {
+        // Lightweight mode - no aggressive status querying
         queryPrinterCommandFlag = ESC;
-        ThreadPool.getInstantiation().addSerialTask(new Runnable() {
-            @Override
-            public void run() {
-                //开启计时器，隔2000毫秒没有没返回值时发送查询打印机状态指令，先发票据，面单，标签
-                final ThreadFactoryBuilder threadFactoryBuilder = new ThreadFactoryBuilder("Timer");
-                final ScheduledExecutorService scheduledExecutorService = new ScheduledThreadPoolExecutor(1, threadFactoryBuilder);
-                scheduledExecutorService.scheduleAtFixedRate(threadFactoryBuilder.newThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (currentPrinterCommand == null && queryPrinterCommandFlag > TSC) {
-                            if (reader != null) {//三种状态，查询无返回值，发送连接失败广播
-                                reader.cancel();
-                                mPort.closePort();
-                                isOpenPort = false;
-
-                                scheduledExecutorService.shutdown();
-                            }
-                        }
-                        if (currentPrinterCommand != null) {
-                            if (scheduledExecutorService != null && !scheduledExecutorService.isShutdown()) {
-                                scheduledExecutorService.shutdown();
-                            }
-                            return;
-                        }
-                        switch (queryPrinterCommandFlag) {
-                            case ESC:
-                                //发送ESC查询打印机状态指令
-                                sendCommand = esc;
-                                break;
-                            case TSC:
-                                //发送ESC查询打印机状态指令
-                                sendCommand = tsc;
-                                break;
-                            case CPCL:
-                                //发送CPCL查询打印机状态指令
-                                sendCommand = cpcl;
-                                break;
-                            default:
-                                break;
-                        }
-                        Vector<Byte> data = new Vector<>(sendCommand.length);
-                        for (int i = 0; i < sendCommand.length; i++) {
-                            data.add(sendCommand[i]);
-                        }
-                        sendDataImmediately(data);
-                        queryPrinterCommandFlag++;
-                    }
-                }), 1500, 1500, TimeUnit.MILLISECONDS);
-            }
-        });
+        Log.d(TAG, "Printer command set to ESC (lightweight mode - no aggressive polling)");
+        // Removed the aggressive 1.5 second status polling that was causing connection issues
     }
 
     class PrinterReader extends Thread {
         private boolean isRun = false;
 
-        private byte[] buffer = new byte[100];
+        private byte[] buffer = new byte[32]; // Smaller buffer for lighter operation
 
         public PrinterReader() {
             isRun = true;
@@ -491,13 +456,22 @@ public class DeviceConnFactoryManager {
 
         @Override
         public void run() {
+            int consecutiveErrors = 0;
             try {
                 while (isRun) {
+                    // Check if port is still open before reading
+                    if (mPort == null || !isOpenPort) {
+                        Log.d(TAG, "Port closed, stopping reader");
+                        break;
+                    }
+                    
                     //读取打印机返回信息,打印机没有返回纸返回-1
                     Log.e(TAG,"wait read ");
                     int len = readDataImmediately(buffer);
                     Log.e(TAG," read "+len);
+                    
                     if (len > 0) {
+                        consecutiveErrors = 0; // Reset error counter on successful read
                         Message message = Message.obtain();
                         message.what = READ_DATA;
                         Bundle bundle = new Bundle();
@@ -505,9 +479,35 @@ public class DeviceConnFactoryManager {
                         bundle.putByteArray(READ_BUFFER_ARRAY, buffer); //数据
                         message.setData(bundle);
                         mHandler.sendMessage(message);
+                    } else if (len == -1) {
+                        // Connection lost - check if this is expected (port closed)
+                        if (mPort == null || !isOpenPort) {
+                            Log.d(TAG, "Port closed, stopping reader gracefully");
+                            break;
+                        }
+                        
+                        // Connection lost, but don't immediately disconnect
+                        consecutiveErrors++;
+                        Log.d(TAG, "Connection lost, error count: " + consecutiveErrors);
+                        
+                        // Only disconnect after multiple consecutive errors
+                        if (consecutiveErrors >= 3) {
+                            Log.d(TAG, "Too many consecutive errors, disconnecting");
+                            break;
+                        }
+                        
+                        // Wait longer before trying again (reduced CPU usage)
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            break;
+                        }
                     }
                 }
             } catch (Exception e) {//异常断开
+                Log.e(TAG, "Bluetooth connection error: " + e.getMessage());
+            } finally {
+                isRun = false;
                 if (deviceConnFactoryManagers[id] != null) {
                     closePort(id);
                     mHandler.obtainMessage(Constant.abnormal_Disconnection).sendToTarget();
