@@ -14,6 +14,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -46,7 +47,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final String TAG = "BluetoothBasicPlugin";
     private final int id = 0;
     private ThreadPool threadPool;
-    private static final int REQUEST_COARSE_LOCATION_PERMISSIONS = 1451;
+    private static final int REQUEST_SCAN_PERMISSIONS = 1451;
     private static final String NAMESPACE = "flutter_bluetooth_basic";
     private Activity activity;
     private MethodChannel channel;
@@ -55,6 +56,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private ActivityPluginBinding activityPluginBinding;
 
     private Result pendingResult;
+    private String pendingPermissionDeniedMessage;
 
     @Override
     public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
@@ -79,13 +81,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 result.success(threadPool != null);
                 break;
             case "startScan": {
-                if (ContextCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_COARSE_LOCATION)
-                        != PackageManager.PERMISSION_GRANTED) {
-                    ActivityCompat.requestPermissions(
-                            activity,
-                            new String[]{Manifest.permission.ACCESS_COARSE_LOCATION},
-                            REQUEST_COARSE_LOCATION_PERMISSIONS);
-                    pendingResult = result;
+                if (!ensureScanPermissions(result)) {
                     break;
                 }
                 startScan(result);
@@ -111,6 +107,46 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 result.notImplemented();
                 break;
         }
+    }
+
+    private boolean ensureScanPermissions(Result result) {
+        if (activity == null) {
+            result.error("no_activity", "Cannot request permissions because no Activity is attached.", null);
+            return false;
+        }
+
+        final String[] requiredPermissions;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requiredPermissions = new String[]{
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT
+            };
+            pendingPermissionDeniedMessage =
+                    "This app requires BLUETOOTH_SCAN and BLUETOOTH_CONNECT permissions for scanning";
+        } else {
+            requiredPermissions = new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+            pendingPermissionDeniedMessage =
+                    "This app requires location permissions for scanning on Android 11 and below";
+        }
+
+        final ArrayList<String> missingPermissions = new ArrayList<>();
+        for (String permission : requiredPermissions) {
+            if (ContextCompat.checkSelfPermission(activity, permission) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissions.add(permission);
+            }
+        }
+
+        if (!missingPermissions.isEmpty()) {
+            ActivityCompat.requestPermissions(
+                    activity,
+                    missingPermissions.toArray(new String[0]),
+                    REQUEST_SCAN_PERMISSIONS
+            );
+            pendingResult = result;
+            return false;
+        }
+
+        return true;
     }
 
     private void state(Result result) {
@@ -248,14 +284,27 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
     @Override
     public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQUEST_SCAN_PERMISSIONS) {
+            if (pendingResult == null) {
+                return true;
+            }
 
-        if (requestCode == REQUEST_COARSE_LOCATION_PERMISSIONS) {
-            if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            boolean allGranted = grantResults.length > 0;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+
+            if (allGranted) {
                 startScan(pendingResult);
             } else {
-                pendingResult.error("no_permissions", "This app requires location permissions for scanning", null);
-                pendingResult = null;
+                pendingResult.error("no_permissions", pendingPermissionDeniedMessage, null);
             }
+
+            pendingResult = null;
+            pendingPermissionDeniedMessage = null;
             return true;
         }
         return false;

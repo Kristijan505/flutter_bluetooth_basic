@@ -21,6 +21,15 @@ Inspired by [bluetooth_print](https://github.com/thon-ju/bluetooth_print).
 * Vendor binary gate: `verifyVendorPrinterJar` runs before `preBuild` and logs SHA-256 of `android/libs/gprintersdkv2.jar` because the JAR has no embedded version metadata
 * Regression fallback: if Java 21 causes D8/R8/desugaring issues, keep JDK 21 runtime and lower Java source/target to `17`
 
+## Runtime Permissions
+### Android
+* Android 12+ (`API 31+`): requests `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT`.
+* Android 11 and below: requests `ACCESS_FINE_LOCATION` for Bluetooth scanning.
+
+### iOS
+* iOS deployment target is `13.0`.
+* Host app must provide Bluetooth usage descriptions in `Info.plist` (for example `NSBluetoothAlwaysUsageDescription`).
+
 
 ## Getting Started
 

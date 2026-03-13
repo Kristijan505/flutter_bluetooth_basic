@@ -4,20 +4,21 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_bluetooth_basic'
-  s.version          = '0.0.1'
-  s.summary          = 'A new flutter plugin project.'
+  s.version          = '0.1.7'
+  s.summary          = 'Flutter Bluetooth scan and raw byte transport plugin.'
   s.description      = <<-DESC
-A new flutter plugin project.
+Flutter plugin that scans Bluetooth devices and sends raw bytes data to printers
+on Android and iOS.
                        DESC
-  s.homepage         = 'http://example.com'
+  s.homepage         = 'https://github.com/Kristijan505/flutter_bluetooth_basic'
   s.license          = { :file => '../LICENSE' }
-  s.author           = { 'Your Company' => 'email@example.com' }
+  s.author           = { 'Kristijan505' => 'kristijan505@users.noreply.github.com' }
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.public_header_files = 'Classes/**/*.h'
   s.static_framework = true
   s.dependency 'Flutter'
-  # s.platform = :ios, '8.0'
+  s.platform = :ios, '13.0'
 
   # Import all * .a libraries in the Classes folder
   s.frameworks = ["SystemConfiguration", "CoreTelephony","WebKit"]
