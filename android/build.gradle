@@ -52,7 +52,6 @@ tasks.withType(org.gradle.api.tasks.compile.JavaCompile).configureEach {
     javaCompiler = javaToolchains.compilerFor {
         languageVersion = org.gradle.jvm.toolchain.JavaLanguageVersion.of(21)
     }
-    options.release = 21
 }
 
 tasks.register('verifyVendorPrinterJar') {
