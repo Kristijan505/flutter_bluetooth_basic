@@ -15,6 +15,7 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Parcelable;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -101,7 +102,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         public void onReceive(Context context, Intent intent) {
             final String action = intent.getAction();
             if (BluetoothDevice.ACTION_FOUND.equals(action)) {
-                final BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                final BluetoothDevice device = getParcelableExtraCompat(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
                 if (device != null) {
                     emitScanDevice(device);
                 }
@@ -366,7 +367,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         final IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothDevice.ACTION_FOUND);
         filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
-        activity.registerReceiver(scanReceiver, filter);
+        ContextCompat.registerReceiver(activity, scanReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
         scanReceiverRegistered = true;
     }
 
@@ -381,6 +382,14 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             // receiver already unregistered
         }
         scanReceiverRegistered = false;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static <T extends Parcelable> T getParcelableExtraCompat(Intent intent, String key, Class<T> clazz) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return intent.getParcelableExtra(key, clazz);
+        }
+        return intent.getParcelableExtra(key);
     }
 
     private void connect(Map<String, Object> args, Result result) {
@@ -749,7 +758,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     filter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
                     filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
                     filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
-                    activity.registerReceiver(stateReceiver, filter);
+                    ContextCompat.registerReceiver(activity, stateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
                 }
             }
 
