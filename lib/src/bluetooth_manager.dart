@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:rxdart/rxdart.dart';
 
+import 'bluetooth_errors.dart';
 import 'bluetooth_device.dart';
 
 /// A BluetoothManager.
@@ -30,6 +31,17 @@ class BluetoothManager {
 
   static BluetoothManager get instance => _instance;
 
+  Future<T?> _invokeMethod<T>(
+    final String method, [
+    final dynamic arguments,
+  ]) async {
+    try {
+      return await _channel.invokeMethod<T>(method, arguments);
+    } on PlatformException catch (error) {
+      throw normalizeBluetoothPlatformException(method, error);
+    }
+  }
+
   // Future<bool> get isAvailable async =>
   //     await _channel.invokeMethod('isAvailable').then<bool>((d) => d);
 
@@ -37,7 +49,7 @@ class BluetoothManager {
   //     await _channel.invokeMethod('isOn').then<bool>((d) => d);
 
   Future<bool> get isConnected async =>
-      await _channel.invokeMethod('isConnected');
+      await _invokeMethod<bool>('isConnected') ?? false;
 
   BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanning => _isScanning.stream;
@@ -50,7 +62,7 @@ class BluetoothManager {
 
   /// Gets the current state of the Bluetooth module
   Stream<int?> get state async* {
-    yield await _channel.invokeMethod('state').then((s) => s);
+    yield await _invokeMethod<int>('state');
 
     yield* _stateChannel.receiveBroadcastStream().map((s) => s);
   }
@@ -77,12 +89,12 @@ class BluetoothManager {
     _scanResults.add(<BluetoothDevice>[]);
 
     try {
-      await _channel.invokeMethod('startScan');
-    } catch (e) {
+      await _invokeMethod('startScan');
+    } on PlatformException catch (error) {
       print('Error starting scan.');
       _stopScanPill.add(null);
       _isScanning.add(false);
-      throw e;
+      throw normalizeBluetoothPlatformException('startScan', error);
     }
 
     yield* BluetoothManager.instance._methodStream
@@ -119,25 +131,24 @@ class BluetoothManager {
 
   /// Stops a scan for Bluetooth Low Energy devices
   Future stopScan() async {
-    await _channel.invokeMethod('stopScan');
+    await _invokeMethod('stopScan');
     _stopScanPill.add(null);
     _isScanning.add(false);
   }
 
-  Future<dynamic> connect(BluetoothDevice device) =>
-      _channel.invokeMethod('connect', device.toJson());
+  Future<dynamic> connect(final BluetoothDevice device) =>
+      _invokeMethod('connect', device.toJson());
 
-  Future<dynamic> disconnect() => _channel.invokeMethod('disconnect');
+  Future<dynamic> disconnect() => _invokeMethod('disconnect');
 
-  Future<dynamic> destroy() => _channel.invokeMethod('destroy');
+  Future<dynamic> destroy() => _invokeMethod('destroy');
 
-  Future<dynamic> writeData(List<int> bytes) {
-    Map<String, Object> args = Map();
-    args['bytes'] = bytes;
-    args['length'] = bytes.length;
+  Future<dynamic> writeData(final List<int> bytes) async {
+    final args = <String, Object>{
+      'bytes': bytes,
+      'length': bytes.length,
+    };
 
-    _channel.invokeMethod('writeData', args);
-
-    return Future.value(true);
+    return await _invokeMethod('writeData', args) ?? true;
   }
 }

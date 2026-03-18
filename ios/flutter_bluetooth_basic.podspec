@@ -14,15 +14,13 @@ on Android and iOS.
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Kristijan505' => 'kristijan505@users.noreply.github.com' }
   s.source           = { :path => '.' }
-  s.source_files = 'Classes/**/*'
-  s.public_header_files = 'Classes/**/*.h'
+  s.source_files = 'Classes/FlutterBluetoothBasicPlugin.{h,m}'
+  s.public_header_files = 'Classes/FlutterBluetoothBasicPlugin.h'
   s.static_framework = true
   s.dependency 'Flutter'
   s.platform = :ios, '13.0'
 
-  # Import all * .a libraries in the Classes folder
-  s.frameworks = ["SystemConfiguration", "CoreTelephony","WebKit"]
-  s.vendored_libraries = '**/*.a'
+  s.frameworks = ['CoreBluetooth']
 
   # Flutter.framework does not contain a i386 slice. Only x86_64 simulators are supported.
   # s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'VALID_ARCHS[sdk=iphonesimulator*]' => 'x86_64' }

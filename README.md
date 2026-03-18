@@ -18,7 +18,7 @@ Inspired by [bluetooth_print](https://github.com/thon-ju/bluetooth_print).
 * Java source/target level: `21`
 * Kotlin plugin is intentionally not configured in this module
 * Future Kotlin policy: if Kotlin is introduced, pin `kotlin-gradle-plugin` to `2.3.10+` with AGP `8.13.2+`
-* Vendor binary gate: `verifyVendorPrinterJar` runs before `preBuild` and logs SHA-256 of `android/libs/gprintersdkv2.jar` because the JAR has no embedded version metadata
+* Android transport is implemented directly through `BluetoothSocket` (SPP) without vendored printer SDK binaries
 * Regression fallback: if Java 21 causes D8/R8/desugaring issues, keep JDK 21 runtime and lower Java source/target to `17`
 
 ## Runtime Permissions
