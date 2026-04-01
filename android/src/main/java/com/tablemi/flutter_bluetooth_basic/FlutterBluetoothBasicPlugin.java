@@ -60,7 +60,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final long CONNECT_TIMEOUT_MS = 12_000L;
     private static final long WRITE_TIMEOUT_MS = 60_000L;
     private static final long WRITE_RETRY_DELAY_MS = 250L;
-    private static final long CHUNK_PAUSE_MS = 20L;
+    private static final long CHUNK_PAUSE_MS = 50L;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     private final Object connectionLock = new Object();
@@ -80,6 +80,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private volatile boolean connected;
     private volatile boolean scanning;
     private volatile boolean scanReceiverRegistered;
+    private volatile boolean writingData;
 
     private final Set<String> seenScanAddresses = new HashSet<>();
     private final Map<String, BluetoothDevice> discoveredDevices = new LinkedHashMap<>();
@@ -131,6 +132,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
                 emitState(STATE_CONNECTED);
             } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
+                // During writeData retry, stale ACL_DISCONNECTED from a
+                // previously closed socket arrives asynchronously and would
+                // kill the new active socket.  Ignore while writing.
+                if (writingData) {
+                    Log.d(TAG, "ACL_DISCONNECTED ignored during write");
+                    return;
+                }
                 connected = false;
                 synchronized (connectionLock) {
                     closeActiveSocketLocked();
@@ -141,6 +149,10 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 if (connectionState == BluetoothProfile.STATE_CONNECTED) {
                     emitState(STATE_CONNECTED);
                 } else if (connectionState == BluetoothProfile.STATE_DISCONNECTED) {
+                    if (writingData) {
+                        Log.d(TAG, "CONNECTION_STATE_DISCONNECTED ignored during write");
+                        return;
+                    }
                     connected = false;
                     synchronized (connectionLock) {
                         closeActiveSocketLocked();
@@ -530,16 +542,21 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
 
         ioExecutor.execute(() -> {
+            writingData = true;
             final AtomicBoolean completed = new AtomicBoolean(false);
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
+                    writingData = false;
                     disconnect();
                     postError(result, "job_timeout", "Timed out while writing print job");
                 }
             }, WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
 
             try {
-                final int[] chunkSizes = new int[]{256, 128, 64};
+                // Small chunks with generous pauses to avoid overflowing the
+                // printer's receive buffer (cheap thermal printers ignore RFCOMM
+                // flow control).  Fall back to even smaller chunks on failure.
+                final int[] chunkSizes = new int[]{128, 64, 32};
                 IOException lastError = null;
 
                 for (int attempt = 0; attempt < chunkSizes.length; attempt++) {
@@ -572,6 +589,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     postError(result, code, lastError != null ? lastError.getMessage() : "Write failed");
                 }
             } finally {
+                writingData = false;
                 timeoutFuture.cancel(true);
             }
         });
