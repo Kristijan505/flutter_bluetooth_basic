@@ -59,7 +59,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final int STATE_CONNECTED = 1;
     private static final long CONNECT_TIMEOUT_MS = 12_000L;
     private static final long WRITE_TIMEOUT_MS = 60_000L;
-    private static final long WRITE_RETRY_DELAY_MS = 250L;
+    private static final int CHUNK_SIZE_BYTES = 128;
     private static final long CHUNK_PAUSE_MS = 50L;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
@@ -80,7 +80,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private volatile boolean connected;
     private volatile boolean scanning;
     private volatile boolean scanReceiverRegistered;
-    private volatile boolean writingData;
 
     private final Set<String> seenScanAddresses = new HashSet<>();
     private final Map<String, BluetoothDevice> discoveredDevices = new LinkedHashMap<>();
@@ -132,11 +131,23 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
                 emitState(STATE_CONNECTED);
             } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-                // During writeData retry, stale ACL_DISCONNECTED from a
-                // previously closed socket arrives asynchronously and would
-                // kill the new active socket.  Ignore while writing.
-                if (writingData) {
-                    Log.d(TAG, "ACL_DISCONNECTED ignored during write");
+                // Used to be suppressed while a write was in flight, to
+                // protect a freshly reconnected socket from a stale broadcast
+                // left over by the retry loop that stood here.  There is no
+                // retry any more — writeData never opens a new socket while
+                // writing — so there is nothing left to protect, and
+                // swallowing this broadcast only meant a mid-write
+                // disconnect (e.g. right after the last successful chunk,
+                // before writeData's own finally clears its state) could go
+                // unnoticed: connected stayed true and sendInChunks reported
+                // success even though the link was already gone.
+                //
+                // (Codex nalaz) Android salje ovaj broadcast za SVAKI
+                // uredjaj koji se odspoji, ne samo za nas - slusalice ili
+                // citac crtickog koda koji se ugase usred ispisa ne smiju
+                // srusiti sasvim zdravu vezu s printerom.
+                final BluetoothDevice device = getParcelableExtraCompat(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                if (!isOurConnectedDevice(device)) {
                     return;
                 }
                 connected = false;
@@ -149,8 +160,11 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 if (connectionState == BluetoothProfile.STATE_CONNECTED) {
                     emitState(STATE_CONNECTED);
                 } else if (connectionState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (writingData) {
-                        Log.d(TAG, "CONNECTION_STATE_DISCONNECTED ignored during write");
+                    // Isto filtriranje kao ACTION_ACL_DISCONNECTED gore - i
+                    // ovaj broadcast dolazi za svaku promjenu profila bilo
+                    // kojeg uredjaja, ne samo naseg printera.
+                    final BluetoothDevice device = getParcelableExtraCompat(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                    if (!isOurConnectedDevice(device)) {
                         return;
                     }
                     connected = false;
@@ -404,6 +418,22 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         return intent.getParcelableExtra(key);
     }
 
+    // Android salje ACL_DISCONNECTED i CONNECTION_STATE_CHANGED za SVAKI
+    // Bluetooth uredjaj koji se odspoji, ne samo za onaj s kojim mi
+    // razgovaramo - bez ovog filtera bi se odspajanje slusalica ili citaca
+    // crtickog koda tumacilo kao prekid ispisa. connectedAddress se cita pod
+    // istim connectionLock-om kojim se i postavlja (vidi connectInternal).
+    private boolean isOurConnectedDevice(BluetoothDevice device) {
+        if (device == null) {
+            return false;
+        }
+        final String currentAddress;
+        synchronized (connectionLock) {
+            currentAddress = connectedAddress;
+        }
+        return currentAddress != null && currentAddress.equals(device.getAddress());
+    }
+
     private void connect(Map<String, Object> args, Result result) {
         if (args == null || !args.containsKey("address")) {
             result.error("invalid_argument", "Argument 'address' not found", null);
@@ -485,45 +515,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         emitState(STATE_DISCONNECTED);
     }
 
-    private boolean reconnectForWrite() {
-        final String address;
-        synchronized (connectionLock) {
-            address = connectedAddress;
-        }
-
-        if (address == null) {
-            return false;
-        }
-
-        synchronized (connectionLock) {
-            closeActiveSocketLocked();
-        }
-
-        try {
-            final BluetoothDevice device = bluetoothAdapter.getRemoteDevice(address);
-            final BluetoothSocket socket = createSocket(device);
-            if (bluetoothAdapter.isDiscovering()) {
-                bluetoothAdapter.cancelDiscovery();
-            }
-            socket.connect();
-            synchronized (connectionLock) {
-                activeSocket = socket;
-                activeOutputStream = socket.getOutputStream();
-                connectedAddress = address;
-                connected = true;
-            }
-            emitState(STATE_CONNECTED);
-            return true;
-        } catch (IOException | SecurityException e) {
-            Log.w(TAG, "Reconnect failed", e);
-            synchronized (connectionLock) {
-                closeActiveSocketLocked();
-            }
-            connected = false;
-            return false;
-        }
-    }
-
     private void writeData(Map<String, Object> args, Result result) {
         if (args == null || !args.containsKey("bytes")) {
             result.error("bytes_empty", "Bytes param is empty", null);
@@ -542,11 +533,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
 
         ioExecutor.execute(() -> {
-            writingData = true;
             final AtomicBoolean completed = new AtomicBoolean(false);
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
-                    writingData = false;
                     disconnect();
                     postError(result, "job_timeout", "Timed out while writing print job");
                 }
@@ -555,41 +544,27 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             try {
                 // Small chunks with generous pauses to avoid overflowing the
                 // printer's receive buffer (cheap thermal printers ignore RFCOMM
-                // flow control).  Fall back to even smaller chunks on failure.
-                final int[] chunkSizes = new int[]{128, 64, 32};
-                IOException lastError = null;
-
-                for (int attempt = 0; attempt < chunkSizes.length; attempt++) {
-                    if (completed.get()) {
-                        return;
-                    }
-
-                    if (attempt > 0 && !reconnectForWrite()) {
-                        lastError = new IOException("Reconnect failed");
-                        break;
-                    }
-
-                    try {
-                        sendInChunks(data, chunkSizes[attempt]);
-                        if (completed.compareAndSet(false, true)) {
-                            postSuccess(result, true);
-                        }
-                        return;
-                    } catch (IOException e) {
-                        lastError = e;
-                        if (attempt < chunkSizes.length - 1) {
-                            closeActiveSocketLocked();
-                            sleepQuietly(WRITE_RETRY_DELAY_MS);
-                        }
-                    }
-                }
+                // flow control).
+                //
+                // One pass, no resend.  The retry loop that stood here started
+                // again from byte 0, but the printer had already put the
+                // beginning of the receipt on paper — so part of the receipt
+                // came out twice.  A broken connection now goes straight back
+                // to Dart; reprinting is the user's call, from a dialog.
+                sendInChunks(data, CHUNK_SIZE_BYTES);
 
                 if (completed.compareAndSet(false, true)) {
-                    final String code = classifyWriteError(lastError);
-                    postError(result, code, lastError != null ? lastError.getMessage() : "Write failed");
+                    postSuccess(result, true);
+                }
+            } catch (IOException e) {
+                if (completed.compareAndSet(false, true)) {
+                    // The socket is unusable after a failed write.  Drop it so
+                    // the next print starts from a clean connection instead of
+                    // inheriting a half-written stream.
+                    disconnect();
+                    postError(result, classifyWriteError(e), e.getMessage() != null ? e.getMessage() : "Write failed");
                 }
             } finally {
-                writingData = false;
                 timeoutFuture.cancel(true);
             }
         });
