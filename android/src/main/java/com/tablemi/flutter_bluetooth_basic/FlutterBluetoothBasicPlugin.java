@@ -141,6 +141,15 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 // before writeData's own finally clears its state) could go
                 // unnoticed: connected stayed true and sendInChunks reported
                 // success even though the link was already gone.
+                //
+                // (Codex nalaz) Android salje ovaj broadcast za SVAKI
+                // uredjaj koji se odspoji, ne samo za nas - slusalice ili
+                // citac crtickog koda koji se ugase usred ispisa ne smiju
+                // srusiti sasvim zdravu vezu s printerom.
+                final BluetoothDevice device = getParcelableExtraCompat(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                if (!isOurConnectedDevice(device)) {
+                    return;
+                }
                 connected = false;
                 synchronized (connectionLock) {
                     closeActiveSocketLocked();
@@ -151,6 +160,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 if (connectionState == BluetoothProfile.STATE_CONNECTED) {
                     emitState(STATE_CONNECTED);
                 } else if (connectionState == BluetoothProfile.STATE_DISCONNECTED) {
+                    // Isto filtriranje kao ACTION_ACL_DISCONNECTED gore - i
+                    // ovaj broadcast dolazi za svaku promjenu profila bilo
+                    // kojeg uredjaja, ne samo naseg printera.
+                    final BluetoothDevice device = getParcelableExtraCompat(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                    if (!isOurConnectedDevice(device)) {
+                        return;
+                    }
                     connected = false;
                     synchronized (connectionLock) {
                         closeActiveSocketLocked();
@@ -400,6 +416,22 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             return intent.getParcelableExtra(key, clazz);
         }
         return intent.getParcelableExtra(key);
+    }
+
+    // Android salje ACL_DISCONNECTED i CONNECTION_STATE_CHANGED za SVAKI
+    // Bluetooth uredjaj koji se odspoji, ne samo za onaj s kojim mi
+    // razgovaramo - bez ovog filtera bi se odspajanje slusalica ili citaca
+    // crtickog koda tumacilo kao prekid ispisa. connectedAddress se cita pod
+    // istim connectionLock-om kojim se i postavlja (vidi connectInternal).
+    private boolean isOurConnectedDevice(BluetoothDevice device) {
+        if (device == null) {
+            return false;
+        }
+        final String currentAddress;
+        synchronized (connectionLock) {
+            currentAddress = connectedAddress;
+        }
+        return currentAddress != null && currentAddress.equals(device.getAddress());
     }
 
     private void connect(Map<String, Object> args, Result result) {
