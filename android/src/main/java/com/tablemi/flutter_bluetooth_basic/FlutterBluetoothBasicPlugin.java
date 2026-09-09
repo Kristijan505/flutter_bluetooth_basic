@@ -80,7 +80,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private volatile boolean connected;
     private volatile boolean scanning;
     private volatile boolean scanReceiverRegistered;
-    private volatile boolean writingData;
 
     private final Set<String> seenScanAddresses = new HashSet<>();
     private final Map<String, BluetoothDevice> discoveredDevices = new LinkedHashMap<>();
@@ -132,17 +131,16 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
                 emitState(STATE_CONNECTED);
             } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-                // While a write is in flight, whether the connection is
-                // broken is decided by writeData's own IOException, not by
-                // this broadcast: a physical link drop can raise
-                // ACL_DISCONNECTED before writeData has even seen the
-                // failure, and tearing the socket down here would race
-                // writeData's own disconnect() on error.  Ignore while
-                // writing.
-                if (writingData) {
-                    Log.d(TAG, "ACL_DISCONNECTED ignored during write");
-                    return;
-                }
+                // Used to be suppressed while a write was in flight, to
+                // protect a freshly reconnected socket from a stale broadcast
+                // left over by the retry loop that stood here.  There is no
+                // retry any more — writeData never opens a new socket while
+                // writing — so there is nothing left to protect, and
+                // swallowing this broadcast only meant a mid-write
+                // disconnect (e.g. right after the last successful chunk,
+                // before writeData's own finally clears its state) could go
+                // unnoticed: connected stayed true and sendInChunks reported
+                // success even though the link was already gone.
                 connected = false;
                 synchronized (connectionLock) {
                     closeActiveSocketLocked();
@@ -153,10 +151,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 if (connectionState == BluetoothProfile.STATE_CONNECTED) {
                     emitState(STATE_CONNECTED);
                 } else if (connectionState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (writingData) {
-                        Log.d(TAG, "CONNECTION_STATE_DISCONNECTED ignored during write");
-                        return;
-                    }
                     connected = false;
                     synchronized (connectionLock) {
                         closeActiveSocketLocked();
@@ -507,11 +501,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
 
         ioExecutor.execute(() -> {
-            writingData = true;
             final AtomicBoolean completed = new AtomicBoolean(false);
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
-                    writingData = false;
                     disconnect();
                     postError(result, "job_timeout", "Timed out while writing print job");
                 }
@@ -541,7 +533,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     postError(result, classifyWriteError(e), e.getMessage() != null ? e.getMessage() : "Write failed");
                 }
             } finally {
-                writingData = false;
                 timeoutFuture.cancel(true);
             }
         });
