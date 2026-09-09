@@ -59,7 +59,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final int STATE_CONNECTED = 1;
     private static final long CONNECT_TIMEOUT_MS = 12_000L;
     private static final long WRITE_TIMEOUT_MS = 60_000L;
-    private static final long WRITE_RETRY_DELAY_MS = 250L;
+    private static final int CHUNK_SIZE_BYTES = 128;
     private static final long CHUNK_PAUSE_MS = 50L;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
@@ -485,45 +485,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         emitState(STATE_DISCONNECTED);
     }
 
-    private boolean reconnectForWrite() {
-        final String address;
-        synchronized (connectionLock) {
-            address = connectedAddress;
-        }
-
-        if (address == null) {
-            return false;
-        }
-
-        synchronized (connectionLock) {
-            closeActiveSocketLocked();
-        }
-
-        try {
-            final BluetoothDevice device = bluetoothAdapter.getRemoteDevice(address);
-            final BluetoothSocket socket = createSocket(device);
-            if (bluetoothAdapter.isDiscovering()) {
-                bluetoothAdapter.cancelDiscovery();
-            }
-            socket.connect();
-            synchronized (connectionLock) {
-                activeSocket = socket;
-                activeOutputStream = socket.getOutputStream();
-                connectedAddress = address;
-                connected = true;
-            }
-            emitState(STATE_CONNECTED);
-            return true;
-        } catch (IOException | SecurityException e) {
-            Log.w(TAG, "Reconnect failed", e);
-            synchronized (connectionLock) {
-                closeActiveSocketLocked();
-            }
-            connected = false;
-            return false;
-        }
-    }
-
     private void writeData(Map<String, Object> args, Result result) {
         if (args == null || !args.containsKey("bytes")) {
             result.error("bytes_empty", "Bytes param is empty", null);
@@ -555,38 +516,25 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             try {
                 // Small chunks with generous pauses to avoid overflowing the
                 // printer's receive buffer (cheap thermal printers ignore RFCOMM
-                // flow control).  Fall back to even smaller chunks on failure.
-                final int[] chunkSizes = new int[]{128, 64, 32};
-                IOException lastError = null;
-
-                for (int attempt = 0; attempt < chunkSizes.length; attempt++) {
-                    if (completed.get()) {
-                        return;
-                    }
-
-                    if (attempt > 0 && !reconnectForWrite()) {
-                        lastError = new IOException("Reconnect failed");
-                        break;
-                    }
-
-                    try {
-                        sendInChunks(data, chunkSizes[attempt]);
-                        if (completed.compareAndSet(false, true)) {
-                            postSuccess(result, true);
-                        }
-                        return;
-                    } catch (IOException e) {
-                        lastError = e;
-                        if (attempt < chunkSizes.length - 1) {
-                            closeActiveSocketLocked();
-                            sleepQuietly(WRITE_RETRY_DELAY_MS);
-                        }
-                    }
-                }
+                // flow control).
+                //
+                // One pass, no resend.  The retry loop that stood here started
+                // again from byte 0, but the printer had already put the
+                // beginning of the receipt on paper — so part of the receipt
+                // came out twice.  A broken connection now goes straight back
+                // to Dart; reprinting is the user's call, from a dialog.
+                sendInChunks(data, CHUNK_SIZE_BYTES);
 
                 if (completed.compareAndSet(false, true)) {
-                    final String code = classifyWriteError(lastError);
-                    postError(result, code, lastError != null ? lastError.getMessage() : "Write failed");
+                    postSuccess(result, true);
+                }
+            } catch (IOException e) {
+                if (completed.compareAndSet(false, true)) {
+                    // The socket is unusable after a failed write.  Drop it so
+                    // the next print starts from a clean connection instead of
+                    // inheriting a half-written stream.
+                    disconnect();
+                    postError(result, classifyWriteError(e), e.getMessage() != null ? e.getMessage() : "Write failed");
                 }
             } finally {
                 writingData = false;
