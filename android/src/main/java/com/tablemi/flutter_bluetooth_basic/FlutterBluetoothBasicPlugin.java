@@ -132,9 +132,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
                 emitState(STATE_CONNECTED);
             } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-                // During writeData retry, stale ACL_DISCONNECTED from a
-                // previously closed socket arrives asynchronously and would
-                // kill the new active socket.  Ignore while writing.
+                // While a write is in flight, whether the connection is
+                // broken is decided by writeData's own IOException, not by
+                // this broadcast: a physical link drop can raise
+                // ACL_DISCONNECTED before writeData has even seen the
+                // failure, and tearing the socket down here would race
+                // writeData's own disconnect() on error.  Ignore while
+                // writing.
                 if (writingData) {
                     Log.d(TAG, "ACL_DISCONNECTED ignored during write");
                     return;
