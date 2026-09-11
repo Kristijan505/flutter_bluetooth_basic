@@ -123,6 +123,11 @@ void main() {
   });
 
   test('queryStatus returns quickly when the printer answers immediately, even with a long timeout', () async {
+    // NOTE: this only exercises the mocked MethodChannel - the actual
+    // two-phase timeout/grace wait lives in the native Android layer and
+    // cannot be driven from Dart. What this test guards is narrower: that
+    // the Dart wrapper itself adds no extra client-side waiting on top of
+    // whatever the platform channel returns.
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
           lastCall = methodCall;
