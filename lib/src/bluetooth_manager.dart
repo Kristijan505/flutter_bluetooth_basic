@@ -152,11 +152,17 @@ class BluetoothManager {
     return await _invokeMethod('writeData', args) ?? true;
   }
 
-  /// Sends [request] to the printer and returns whatever it writes back
-  /// within [timeout].
+  /// Sends [request] to the printer and returns whatever it writes back.
   ///
-  /// An empty result means the printer did not answer in time - that is a
-  /// normal outcome, not an error.
+  /// [timeout] is the deadline for the FIRST byte of the reply to arrive.
+  /// Once at least one byte has been received, collection keeps going for
+  /// up to [grace] after the last byte received - not the rest of
+  /// [timeout] - or until [maxBytes] have been read, whichever comes
+  /// first. This keeps a one-byte reply fast even when [timeout] is set
+  /// high for a queued command.
+  ///
+  /// An empty result means the printer did not answer within [timeout] -
+  /// that is a normal outcome, not an error.
   ///
   /// [timeout]'s default of 600ms is enough for a real-time query such as
   /// `DLE EOT`, since the printer answers from its interrupt routine
@@ -166,11 +172,13 @@ class BluetoothManager {
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
+    final Duration grace = const Duration(milliseconds: 50),
     final int maxBytes = 16,
   }) async {
     final args = <String, Object>{
       'bytes': request,
       'timeoutMs': timeout.inMilliseconds,
+      'graceMs': grace.inMilliseconds,
       'maxBytes': maxBytes,
     };
 

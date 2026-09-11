@@ -118,7 +118,55 @@ void main() {
     final args = lastCall!.arguments as Map<dynamic, dynamic>;
     expect(args['bytes'], <int>[0x10, 0x04, 0x01]);
     expect(args['timeoutMs'], 2000);
+    expect(args['graceMs'], 50);
     expect(args['maxBytes'], 4);
+  });
+
+  test('queryStatus returns quickly when the printer answers immediately, even with a long timeout', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            // Stands in for the native side answering almost immediately -
+            // a healthy DLE EOT reply, cleared well inside the grace
+            // window - instead of waiting out the whole timeout.
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+            return Uint8List.fromList(<int>[0x16]);
+          }
+
+          return true;
+        });
+
+    final stopwatch = Stopwatch()..start();
+    final result = await BluetoothManager.instance.queryStatus(
+      <int>[0x10, 0x04, 0x01],
+      timeout: const Duration(seconds: 5),
+    );
+    stopwatch.stop();
+
+    expect(result, <int>[0x16]);
+    expect(stopwatch.elapsed, lessThan(const Duration(seconds: 1)));
+  });
+
+  test('queryStatus returns a full multi-byte ASB-style response', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            return Uint8List.fromList(<int>[0x16, 0x00, 0x08, 0x00]);
+          }
+
+          return true;
+        });
+
+    final result = await BluetoothManager.instance.queryStatus(
+      <int>[0x1D, 0x72, 0x01],
+      maxBytes: 4,
+    );
+
+    expect(result, <int>[0x16, 0x00, 0x08, 0x00]);
   });
 
   test('queryStatus returns an empty Uint8List when the printer does not answer', () async {

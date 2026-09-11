@@ -614,6 +614,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
 
         final int timeoutMs = toIntArg(args.get("timeoutMs"));
+        final int graceMs = toIntArg(args.get("graceMs"));
         final int maxBytes = toIntArg(args.get("maxBytes"));
 
         // ioExecutor is a single-thread executor, so a status query can never
@@ -623,18 +624,18 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // in-progress write would corrupt both.
         ioExecutor.execute(() -> {
             final AtomicBoolean completed = new AtomicBoolean(false);
-            // The guard timeout is padded on top of the caller's read
-            // timeout because the write of the request itself could
-            // theoretically block too.
+            // The guard timeout pads timeoutMs + graceMs by another 5s
+            // because the write of the request itself could theoretically
+            // block too.
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
                     disconnect();
                     postError(result, "job_timeout", "Timed out while querying printer status");
                 }
-            }, timeoutMs + 5000, TimeUnit.MILLISECONDS);
+            }, timeoutMs + graceMs + 5000, TimeUnit.MILLISECONDS);
 
             try {
-                final byte[] response = readStatusResponse(request, timeoutMs, maxBytes);
+                final byte[] response = readStatusResponse(request, timeoutMs, graceMs, maxBytes);
 
                 if (completed.compareAndSet(false, true)) {
                     // An empty array is a legitimate result - it means the
@@ -655,7 +656,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         });
     }
 
-    private byte[] readStatusResponse(byte[] request, int timeoutMs, int maxBytes) throws IOException {
+    private byte[] readStatusResponse(byte[] request, int timeoutMs, int graceMs, int maxBytes) throws IOException {
         final InputStream inputStream;
         final OutputStream outputStream;
         synchronized (connectionLock) {
@@ -688,20 +689,48 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
         final byte[] buffer = new byte[Math.max(maxBytes, 0)];
         int received = 0;
-        final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        while (received < buffer.length && System.nanoTime() < deadlineNanos) {
+
+        // Phase 1: wait for the FIRST byte, up to timeoutMs. DLE EOT answers
+        // from the printer's interrupt routine, so a healthy printer clears
+        // this almost instantly; a queued GS r can take the whole timeout,
+        // since it only answers once the printer works through everything
+        // already ahead of it in the buffer.
+        final long firstByteDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (received == 0 && received < buffer.length && System.nanoTime() < firstByteDeadlineNanos) {
             if (inputStream.available() > 0) {
                 final int toRead = Math.min(inputStream.available(), buffer.length - received);
                 final int read = inputStream.read(buffer, received, toRead);
-                if (read <= 0) {
-                    break;
+                if (read > 0) {
+                    received += read;
                 }
-                received += read;
             } else {
                 // Poll instead of a blocking read(): BluetoothSocket's input
                 // stream has no read timeout, so a blocking read() here would
                 // stall this thread until the connection itself dies.
                 sleepQuietly(READ_POLL_MS);
+            }
+        }
+
+        // Phase 2: once the first byte has landed, keep collecting up to
+        // maxBytes, but only for graceMs after the LAST byte received - not
+        // the rest of timeoutMs. Without this, a one-byte DLE EOT reply
+        // would block the call for the full (multi-second) timeout callers
+        // use for queued GS r requests, even though the printer already
+        // answered.
+        if (received > 0) {
+            long graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
+            while (received < buffer.length && System.nanoTime() < graceDeadlineNanos) {
+                if (inputStream.available() > 0) {
+                    final int toRead = Math.min(inputStream.available(), buffer.length - received);
+                    final int read = inputStream.read(buffer, received, toRead);
+                    if (read <= 0) {
+                        break;
+                    }
+                    received += read;
+                    graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
+                } else {
+                    sleepQuietly(READ_POLL_MS);
+                }
             }
         }
 
