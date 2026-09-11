@@ -92,4 +92,72 @@ void main() {
       ),
     );
   });
+
+  test('queryStatus forwards the request and returns the native byte response', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            return Uint8List.fromList(<int>[0x12, 0x34]);
+          }
+
+          return true;
+        });
+
+    final result = await BluetoothManager.instance.queryStatus(
+      <int>[0x10, 0x04, 0x01],
+      timeout: const Duration(seconds: 2),
+      maxBytes: 4,
+    );
+
+    expect(result, isA<Uint8List>());
+    expect(result, <int>[0x12, 0x34]);
+    expect(lastCall?.method, 'queryStatus');
+
+    final args = lastCall!.arguments as Map<dynamic, dynamic>;
+    expect(args['bytes'], <int>[0x10, 0x04, 0x01]);
+    expect(args['timeoutMs'], 2000);
+    expect(args['maxBytes'], 4);
+  });
+
+  test('queryStatus returns an empty Uint8List when the printer does not answer', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            return null;
+          }
+
+          return true;
+        });
+
+    final result = await BluetoothManager.instance.queryStatus(<int>[0x10, 0x04, 0x01]);
+
+    expect(result, isA<Uint8List>());
+    expect(result, isEmpty);
+  });
+
+  test('queryStatus rethrows normalized PlatformException codes', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            throw PlatformException(code: 'device_lost', message: 'printer disconnected');
+          }
+
+          return true;
+        });
+
+    await expectLater(
+      BluetoothManager.instance.queryStatus(<int>[0x10, 0x04, 0x01]),
+      throwsA(
+        isA<PlatformException>()
+            .having((PlatformException e) => e.code, 'code', BluetoothErrorCodes.deviceDisconnected)
+            .having((PlatformException e) => e.message, 'message', 'printer disconnected'),
+      ),
+    );
+  });
 }

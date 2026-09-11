@@ -10,6 +10,7 @@ static NSString *const BTMethodConnect = @"connect";
 static NSString *const BTMethodDisconnect = @"disconnect";
 static NSString *const BTMethodDestroy = @"destroy";
 static NSString *const BTMethodWriteData = @"writeData";
+static NSString *const BTMethodQueryStatus = @"queryStatus";
 static NSString *const BTMethodScanResult = @"ScanResult";
 
 static NSString *const BTErrorConnectTimeout = @"connect_timeout";
@@ -157,6 +158,16 @@ static FlutterError *BTError(NSString *code, NSString *message, id details) {
   if ([BTMethodWriteData isEqualToString:call.method]) {
     NSDictionary *args = [call arguments];
     [self writeDataWithArguments:args result:result];
+    return;
+  }
+
+  if ([BTMethodQueryStatus isEqualToString:call.method]) {
+    // Reading printer status is not implemented on iOS yet - it requires
+    // subscribing to the BLE notify characteristic, which is a separate,
+    // later phase of work.
+    result(BTError(@"status_unsupported",
+                   @"Printer status is not available on iOS yet.",
+                   nil));
     return;
   }
 

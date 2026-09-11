@@ -23,6 +23,7 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -61,6 +62,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final long WRITE_TIMEOUT_MS = 60_000L;
     private static final int CHUNK_SIZE_BYTES = 128;
     private static final long CHUNK_PAUSE_MS = 50L;
+    private static final long READ_POLL_MS = 10L;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     private final Object connectionLock = new Object();
@@ -76,6 +78,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
     private volatile BluetoothSocket activeSocket;
     private volatile OutputStream activeOutputStream;
+    private volatile InputStream activeInputStream;
     private volatile String connectedAddress;
     private volatile boolean connected;
     private volatile boolean scanning;
@@ -219,6 +222,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 break;
             case "writeData":
                 writeData(args, result);
+                break;
+            case "queryStatus":
+                queryStatus(args, result);
                 break;
             default:
                 result.notImplemented();
@@ -474,6 +480,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 synchronized (connectionLock) {
                     activeSocket = socket;
                     activeOutputStream = socket.getOutputStream();
+                    activeInputStream = socket.getInputStream();
                     connectedAddress = address;
                     connected = true;
                 }
@@ -589,6 +596,127 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
     }
 
+    private void queryStatus(Map<String, Object> args, Result result) {
+        if (args == null || !args.containsKey("bytes")) {
+            result.error("bytes_empty", "Bytes param is empty", null);
+            return;
+        }
+
+        final byte[] request = toByteArray(args.get("bytes"));
+        if (request.length == 0) {
+            result.error("bytes_empty", "Bytes param is empty", null);
+            return;
+        }
+
+        if (!connected || connectedAddress == null) {
+            result.error("device_disconnected", "Printer is not connected", null);
+            return;
+        }
+
+        final int timeoutMs = toIntArg(args.get("timeoutMs"));
+        final int maxBytes = toIntArg(args.get("maxBytes"));
+
+        // ioExecutor is a single-thread executor, so a status query can never
+        // interrupt a print job that is already in flight - it simply queues
+        // up behind it and runs once the write finishes. This is intentional:
+        // the RFCOMM stream is shared, and interleaving a read with an
+        // in-progress write would corrupt both.
+        ioExecutor.execute(() -> {
+            final AtomicBoolean completed = new AtomicBoolean(false);
+            // The guard timeout is padded on top of the caller's read
+            // timeout because the write of the request itself could
+            // theoretically block too.
+            final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
+                if (completed.compareAndSet(false, true)) {
+                    disconnect();
+                    postError(result, "job_timeout", "Timed out while querying printer status");
+                }
+            }, timeoutMs + 5000, TimeUnit.MILLISECONDS);
+
+            try {
+                final byte[] response = readStatusResponse(request, timeoutMs, maxBytes);
+
+                if (completed.compareAndSet(false, true)) {
+                    // An empty array is a legitimate result - it means the
+                    // printer did not answer in time - and is not an error,
+                    // so it must not trigger a disconnect.
+                    postSuccess(result, response);
+                }
+            } catch (IOException e) {
+                if (completed.compareAndSet(false, true)) {
+                    // The socket is unusable after a failed read/write, same
+                    // reasoning as writeData.
+                    disconnect();
+                    postError(result, classifyWriteError(e), e.getMessage() != null ? e.getMessage() : "Query failed");
+                }
+            } finally {
+                timeoutFuture.cancel(true);
+            }
+        });
+    }
+
+    private byte[] readStatusResponse(byte[] request, int timeoutMs, int maxBytes) throws IOException {
+        final InputStream inputStream;
+        final OutputStream outputStream;
+        synchronized (connectionLock) {
+            if (!connected || activeSocket == null || activeInputStream == null || activeOutputStream == null) {
+                throw new IOException("Printer disconnected");
+            }
+            inputStream = activeInputStream;
+            outputStream = activeOutputStream;
+        }
+
+        // Drain whatever is already sitting in the input buffer before asking
+        // our own question. The printer can push an unsolicited ASB packet on
+        // its own, without being asked, and if we didn't drain it here we
+        // could mistake it for the answer to this query.
+        int discarded = 0;
+        final byte[] drainBuffer = new byte[64];
+        while (inputStream.available() > 0) {
+            final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
+            if (read <= 0) {
+                break;
+            }
+            discarded += read;
+        }
+        if (discarded > 0) {
+            Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input before status query");
+        }
+
+        outputStream.write(request);
+        outputStream.flush();
+
+        final byte[] buffer = new byte[Math.max(maxBytes, 0)];
+        int received = 0;
+        final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (received < buffer.length && System.nanoTime() < deadlineNanos) {
+            if (inputStream.available() > 0) {
+                final int toRead = Math.min(inputStream.available(), buffer.length - received);
+                final int read = inputStream.read(buffer, received, toRead);
+                if (read <= 0) {
+                    break;
+                }
+                received += read;
+            } else {
+                // Poll instead of a blocking read(): BluetoothSocket's input
+                // stream has no read timeout, so a blocking read() here would
+                // stall this thread until the connection itself dies.
+                sleepQuietly(READ_POLL_MS);
+            }
+        }
+
+        if (received == buffer.length) {
+            return buffer;
+        }
+        final byte[] trimmed = new byte[received];
+        System.arraycopy(buffer, 0, trimmed, 0, received);
+        return trimmed;
+    }
+
+    private int toIntArg(Object value) {
+        return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
     private byte[] toByteArray(Object bytesValue) {
         if (!(bytesValue instanceof ArrayList)) {
             return new byte[0];
@@ -663,6 +791,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         closeSocket(activeSocket);
         activeSocket = null;
         activeOutputStream = null;
+        activeInputStream = null;
         connected = false;
     }
 

@@ -151,4 +151,30 @@ class BluetoothManager {
 
     return await _invokeMethod('writeData', args) ?? true;
   }
+
+  /// Sends [request] to the printer and returns whatever it writes back
+  /// within [timeout].
+  ///
+  /// An empty result means the printer did not answer in time - that is a
+  /// normal outcome, not an error.
+  ///
+  /// [timeout]'s default of 600ms is enough for a real-time query such as
+  /// `DLE EOT`, since the printer answers from its interrupt routine
+  /// immediately. Callers MUST raise it to several seconds for a queued
+  /// query such as `GS r`, whose answer only arrives after the printer has
+  /// worked through everything already sitting in its buffer.
+  Future<Uint8List> queryStatus(
+    final List<int> request, {
+    final Duration timeout = const Duration(milliseconds: 600),
+    final int maxBytes = 16,
+  }) async {
+    final args = <String, Object>{
+      'bytes': request,
+      'timeoutMs': timeout.inMilliseconds,
+      'maxBytes': maxBytes,
+    };
+
+    final result = await _invokeMethod<Uint8List>('queryStatus', args);
+    return result ?? Uint8List(0);
+  }
 }
