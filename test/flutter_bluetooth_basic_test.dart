@@ -108,6 +108,7 @@ void main() {
     final result = await BluetoothManager.instance.queryStatus(
       <int>[0x10, 0x04, 0x01],
       timeout: const Duration(seconds: 2),
+      quietPeriod: const Duration(milliseconds: 200),
       maxBytes: 4,
     );
 
@@ -119,6 +120,7 @@ void main() {
     expect(args['bytes'], <int>[0x10, 0x04, 0x01]);
     expect(args['timeoutMs'], 2000);
     expect(args['graceMs'], 50);
+    expect(args['quietMs'], 200);
     expect(args['maxBytes'], 4);
   });
 

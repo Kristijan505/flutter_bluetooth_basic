@@ -169,16 +169,31 @@ class BluetoothManager {
   /// immediately. Callers MUST raise it to several seconds for a queued
   /// query such as `GS r`, whose answer only arrives after the printer has
   /// worked through everything already sitting in its buffer.
+  ///
+  /// [quietPeriod] is a best-effort MITIGATION for a limitation of ESC/POS
+  /// itself, not a fix: a reply carries no tag saying which request it
+  /// answers. If the previous call to [queryStatus] timed out without any
+  /// reply, its answer may still be in flight when this call sends its own
+  /// request; the native side then waits for the serial line to go quiet
+  /// for [quietPeriod] before sending, instead of trusting the first gap in
+  /// incoming bytes, so that stale reply gets drained instead of being
+  /// mistaken for this call's answer. This narrows the window for
+  /// mis-pairing a reply with the wrong request - it does not close it.
+  /// Matching a reply to the request it actually answers by its fixed bits
+  /// is the caller's responsibility, since only the caller knows which
+  /// command it sent.
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
     final Duration grace = const Duration(milliseconds: 50),
+    final Duration quietPeriod = const Duration(milliseconds: 150),
     final int maxBytes = 16,
   }) async {
     final args = <String, Object>{
       'bytes': request,
       'timeoutMs': timeout.inMilliseconds,
       'graceMs': grace.inMilliseconds,
+      'quietMs': quietPeriod.inMilliseconds,
       'maxBytes': maxBytes,
     };
 

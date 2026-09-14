@@ -63,6 +63,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final int CHUNK_SIZE_BYTES = 128;
     private static final long CHUNK_PAUSE_MS = 50L;
     private static final long READ_POLL_MS = 10L;
+    private static final long QUIET_DRAIN_CAP_MS = 1000L;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     private final Object connectionLock = new Object();
@@ -81,6 +82,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private volatile InputStream activeInputStream;
     private volatile String connectedAddress;
     private volatile boolean connected;
+    // Set when a status query's first phase timed out without receiving a
+    // single byte. ESC/POS replies carry no tag identifying which request
+    // they answer, so a late reply to that timed-out query can still be on
+    // its way in and land just as the NEXT query is drained and sent. While
+    // set, the next query's drain waits for a quiet line instead of
+    // stopping the instant available() reads zero.
+    private volatile boolean previousStatusQueryUnanswered;
     private volatile boolean scanning;
     private volatile boolean scanReceiverRegistered;
 
@@ -483,6 +491,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     activeInputStream = socket.getInputStream();
                     connectedAddress = address;
                     connected = true;
+                    previousStatusQueryUnanswered = false;
                 }
                 emitState(STATE_CONNECTED);
                 postSuccess(result, true);
@@ -615,6 +624,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
         final int timeoutMs = toIntArg(args.get("timeoutMs"));
         final int graceMs = toIntArg(args.get("graceMs"));
+        final int quietMs = toIntArg(args.get("quietMs"));
         final int maxBytes = toIntArg(args.get("maxBytes"));
 
         // ioExecutor is a single-thread executor, so a status query can never
@@ -624,7 +634,8 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // in-progress write would corrupt both.
         ioExecutor.execute(() -> {
             final AtomicBoolean completed = new AtomicBoolean(false);
-            // The guard timeout pads timeoutMs + graceMs by another 5s
+            // The guard timeout pads timeoutMs + graceMs by QUIET_DRAIN_CAP_MS
+            // (the worst case for the quiet-line drain below) plus another 5s
             // because the write of the request itself could theoretically
             // block too.
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
@@ -632,10 +643,10 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     disconnect();
                     postError(result, "job_timeout", "Timed out while querying printer status");
                 }
-            }, timeoutMs + graceMs + 5000, TimeUnit.MILLISECONDS);
+            }, timeoutMs + graceMs + QUIET_DRAIN_CAP_MS + 5000, TimeUnit.MILLISECONDS);
 
             try {
-                final byte[] response = readStatusResponse(request, timeoutMs, graceMs, maxBytes);
+                final byte[] response = readStatusResponse(request, timeoutMs, graceMs, quietMs, maxBytes);
 
                 if (completed.compareAndSet(false, true)) {
                     // An empty array is a legitimate result - it means the
@@ -656,7 +667,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         });
     }
 
-    private byte[] readStatusResponse(byte[] request, int timeoutMs, int graceMs, int maxBytes) throws IOException {
+    private byte[] readStatusResponse(byte[] request, int timeoutMs, int graceMs, int quietMs, int maxBytes) throws IOException {
         final InputStream inputStream;
         final OutputStream outputStream;
         synchronized (connectionLock) {
@@ -671,17 +682,50 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // our own question. The printer can push an unsolicited ASB packet on
         // its own, without being asked, and if we didn't drain it here we
         // could mistake it for the answer to this query.
+        //
+        // This is a mitigation, not a fix: ESC/POS replies carry no tag
+        // saying which request they answer, so pairing a reply to its
+        // request is fundamentally the caller's job (it knows which fixed
+        // bits to expect back). If the PREVIOUS query timed out in phase 1
+        // without a single byte, its answer may still be in flight and
+        // land mid-drain or mid-send of this one - a plain "stop once
+        // available() == 0" drain would miss it. In that case we instead
+        // wait for the line to go quiet for quietMs, capped overall at
+        // QUIET_DRAIN_CAP_MS so a printer that stays chatty can't stall
+        // this query forever.
         int discarded = 0;
         final byte[] drainBuffer = new byte[64];
-        while (inputStream.available() > 0) {
-            final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
-            if (read <= 0) {
-                break;
+        if (previousStatusQueryUnanswered) {
+            final long drainCapNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(QUIET_DRAIN_CAP_MS);
+            long quietSinceNanos = System.nanoTime();
+            while (System.nanoTime() < drainCapNanos) {
+                if (inputStream.available() > 0) {
+                    final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
+                    if (read <= 0) {
+                        break;
+                    }
+                    discarded += read;
+                    quietSinceNanos = System.nanoTime();
+                } else if (System.nanoTime() - quietSinceNanos >= TimeUnit.MILLISECONDS.toNanos(quietMs)) {
+                    break;
+                } else {
+                    sleepQuietly(READ_POLL_MS);
+                }
             }
-            discarded += read;
-        }
-        if (discarded > 0) {
-            Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input before status query");
+            if (discarded > 0) {
+                Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input while waiting for a quiet line after an unanswered query");
+            }
+        } else {
+            while (inputStream.available() > 0) {
+                final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
+                if (read <= 0) {
+                    break;
+                }
+                discarded += read;
+            }
+            if (discarded > 0) {
+                Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input before status query");
+            }
         }
 
         outputStream.write(request);
@@ -733,6 +777,10 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 }
             }
         }
+
+        // Remember whether this query got any bytes at all, so the NEXT
+        // query knows whether a stale reply might still be in flight.
+        previousStatusQueryUnanswered = received == 0;
 
         if (received == buffer.length) {
             return buffer;
@@ -822,6 +870,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         activeOutputStream = null;
         activeInputStream = null;
         connected = false;
+        previousStatusQueryUnanswered = false;
     }
 
     private void sleepQuietly(long millis) {
