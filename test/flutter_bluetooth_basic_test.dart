@@ -52,6 +52,23 @@ void main() {
     expect(args['bytes'], <int>[1, 2, 3]);
   });
 
+  test('writeData forwards a Uint8List request byte-for-byte', () async {
+    // StandardMethodCodec encodes a Uint8List as the wire's typed "bytes"
+    // format (not a generic list), and decodes it back to a Uint8List here
+    // in Dart, and to a raw byte[] on the Android side (see
+    // FlutterBluetoothBasicPlugin#toByteArray). This test only exercises
+    // the Dart round-trip through the mocked channel - it does not and
+    // cannot cover the Android-side decoding, which has no test here.
+    final bytes = Uint8List.fromList(<int>[0x10, 0x04, 0x01]);
+
+    final result = await BluetoothManager.instance.writeData(bytes);
+
+    expect(result, isTrue);
+    final args = lastCall!.arguments as Map<dynamic, dynamic>;
+    expect(args['bytes'], isA<Uint8List>());
+    expect(args['bytes'], <int>[0x10, 0x04, 0x01]);
+  });
+
   test('normalizeBluetoothErrorCode maps legacy codes to stable codes', () {
     expect(
       normalizeBluetoothErrorCode('connect', 'timeout'),
@@ -214,6 +231,32 @@ void main() {
             .having((PlatformException e) => e.message, 'message', 'printer disconnected'),
       ),
     );
+  });
+
+  test('queryStatus forwards a Uint8List request byte-for-byte', () async {
+    // See the note on the writeData Uint8List test above: this covers only
+    // the Dart-side round-trip through the mocked channel, not the
+    // Android-side byte[] decoding that FlutterBluetoothBasicPlugin
+    // performs in toByteArray.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+          lastCall = methodCall;
+
+          if (methodCall.method == 'queryStatus') {
+            return Uint8List.fromList(<int>[0x12, 0x34]);
+          }
+
+          return true;
+        });
+
+    final request = Uint8List.fromList(<int>[0x10, 0x04, 0x01]);
+
+    final result = await BluetoothManager.instance.queryStatus(request);
+
+    expect(result, <int>[0x12, 0x34]);
+    final args = lastCall!.arguments as Map<dynamic, dynamic>;
+    expect(args['bytes'], isA<Uint8List>());
+    expect(args['bytes'], <int>[0x10, 0x04, 0x01]);
   });
 
   group('queryStatus argument validation', () {

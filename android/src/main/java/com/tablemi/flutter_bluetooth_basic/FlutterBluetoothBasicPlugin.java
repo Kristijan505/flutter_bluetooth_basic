@@ -26,9 +26,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -800,11 +802,37 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     }
 
     private byte[] toByteArray(Object bytesValue) {
-        if (!(bytesValue instanceof ArrayList)) {
+        // StandardMessageCodec decodes a Dart Uint8List argument as a raw
+        // byte[] on Android (not an ArrayList), and Int32List/Int64List as
+        // int[]/long[]; without handling those, a caller passing a typed
+        // list (e.g. Uint8List.fromList(...)) silently produced bytes_empty.
+        if (bytesValue instanceof byte[]) {
+            return Arrays.copyOf((byte[]) bytesValue, ((byte[]) bytesValue).length);
+        }
+
+        if (bytesValue instanceof int[]) {
+            final int[] ints = (int[]) bytesValue;
+            final byte[] data = new byte[ints.length];
+            for (int i = 0; i < ints.length; i++) {
+                data[i] = (byte) (ints[i] & 0xFF);
+            }
+            return data;
+        }
+
+        if (bytesValue instanceof long[]) {
+            final long[] longs = (long[]) bytesValue;
+            final byte[] data = new byte[longs.length];
+            for (int i = 0; i < longs.length; i++) {
+                data[i] = (byte) (longs[i] & 0xFF);
+            }
+            return data;
+        }
+
+        if (!(bytesValue instanceof List)) {
             return new byte[0];
         }
 
-        final ArrayList<?> list = (ArrayList<?>) bytesValue;
+        final List<?> list = (List<?>) bytesValue;
         final byte[] data = new byte[list.size()];
         for (int i = 0; i < list.size(); i++) {
             final Object item = list.get(i);
