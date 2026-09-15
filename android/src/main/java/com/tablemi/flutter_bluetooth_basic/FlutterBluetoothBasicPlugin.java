@@ -23,11 +23,14 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -61,6 +64,14 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final long WRITE_TIMEOUT_MS = 60_000L;
     private static final int CHUNK_SIZE_BYTES = 128;
     private static final long CHUNK_PAUSE_MS = 50L;
+    private static final long READ_POLL_MS = 10L;
+    private static final long QUIET_DRAIN_CAP_MS = 1000L;
+    // Hard ceiling for a status reply. Real ESC/POS replies are a handful of
+    // bytes, so this is not a protocol limit - it only keeps a wild caller
+    // value (e.g. 1_000_000_000) from turning into a ~1 GB allocation, which
+    // would surface as an OutOfMemoryError the IOException handler cannot
+    // catch and could kill the process.
+    private static final int MAX_STATUS_RESPONSE_BYTES = 64 * 1024;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     private final Object connectionLock = new Object();
@@ -76,8 +87,16 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
     private volatile BluetoothSocket activeSocket;
     private volatile OutputStream activeOutputStream;
+    private volatile InputStream activeInputStream;
     private volatile String connectedAddress;
     private volatile boolean connected;
+    // Set when a status query's first phase timed out without receiving a
+    // single byte. ESC/POS replies carry no tag identifying which request
+    // they answer, so a late reply to that timed-out query can still be on
+    // its way in and land just as the NEXT query is drained and sent. While
+    // set, the next query's drain waits for a quiet line instead of
+    // stopping the instant available() reads zero.
+    private volatile boolean previousStatusQueryUnanswered;
     private volatile boolean scanning;
     private volatile boolean scanReceiverRegistered;
 
@@ -219,6 +238,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 break;
             case "writeData":
                 writeData(args, result);
+                break;
+            case "queryStatus":
+                queryStatus(args, result);
                 break;
             default:
                 result.notImplemented();
@@ -465,6 +487,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 final BluetoothSocket socket = createSocket(device);
                 socketRef.set(socket);
                 socket.connect();
+                // Both streams are acquired BEFORE completed is set: if the
+                // socket dies between connect() and here, these throw while
+                // completed is still false, so the catch below can still
+                // report the failure and clean up instead of leaving the
+                // Dart connect future pending forever.
+                final OutputStream outputStream = socket.getOutputStream();
+                final InputStream inputStream = socket.getInputStream();
 
                 if (!completed.compareAndSet(false, true)) {
                     closeSocket(socket);
@@ -473,9 +502,11 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
                 synchronized (connectionLock) {
                     activeSocket = socket;
-                    activeOutputStream = socket.getOutputStream();
+                    activeOutputStream = outputStream;
+                    activeInputStream = inputStream;
                     connectedAddress = address;
                     connected = true;
+                    previousStatusQueryUnanswered = false;
                 }
                 emitState(STATE_CONNECTED);
                 postSuccess(result, true);
@@ -589,12 +620,275 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         }
     }
 
+    private void queryStatus(Map<String, Object> args, Result result) {
+        if (args == null || !args.containsKey("bytes")) {
+            result.error("bytes_empty", "Bytes param is empty", null);
+            return;
+        }
+
+        final byte[] request = toByteArray(args.get("bytes"));
+        if (request.length == 0) {
+            result.error("bytes_empty", "Bytes param is empty", null);
+            return;
+        }
+
+        if (!connected || connectedAddress == null) {
+            result.error("device_disconnected", "Printer is not connected", null);
+            return;
+        }
+
+        // Durations are read as long first: a Dart Duration bigger than
+        // Integer.MAX_VALUE milliseconds (~24.8 days) arrives as a Long, and
+        // intValue() would silently wrap it negative - a wrapped timeout makes
+        // the guard fire immediately and disconnect a healthy printer.
+        final long timeoutMsArg = toLongArg(args.get("timeoutMs"));
+        final long graceMsArg = toLongArg(args.get("graceMs"));
+        final long quietMsArg = toLongArg(args.get("quietMs"));
+        final int maxBytes = toIntArg(args.get("maxBytes"));
+        if (timeoutMsArg < 0 || timeoutMsArg > Integer.MAX_VALUE
+                || graceMsArg < 0 || graceMsArg > Integer.MAX_VALUE
+                || quietMsArg < 0 || quietMsArg > Integer.MAX_VALUE) {
+            result.error("invalid_args", "timeoutMs/graceMs/quietMs must be between 0 and " + Integer.MAX_VALUE, null);
+            return;
+        }
+        if (maxBytes <= 0 || maxBytes > MAX_STATUS_RESPONSE_BYTES) {
+            result.error("invalid_args", "maxBytes must be between 1 and " + MAX_STATUS_RESPONSE_BYTES, null);
+            return;
+        }
+        final int timeoutMs = (int) timeoutMsArg;
+        final int graceMs = (int) graceMsArg;
+        final int quietMs = (int) quietMsArg;
+
+        // ioExecutor is a single-thread executor, so a status query can never
+        // interrupt a print job that is already in flight - it simply queues
+        // up behind it and runs once the write finishes. This is intentional:
+        // the RFCOMM stream is shared, and interleaving a read with an
+        // in-progress write would corrupt both.
+        ioExecutor.execute(() -> {
+            final AtomicBoolean completed = new AtomicBoolean(false);
+            // Phase 2 (see readStatusResponse) renews its graceMs window once
+            // per byte actually received, so in the worst case it renews up
+            // to maxBytes times. Each renewal can also overshoot its deadline
+            // by up to READ_POLL_MS - availability is polled, and a byte that
+            // lands during the final sleep is still accepted - so one renewal
+            // costs at most graceMs + READ_POLL_MS, not graceMs.
+            // The guard timeout has to cover that whole worst case: timeoutMs
+            // for phase 1, plus maxBytes * (graceMs + READ_POLL_MS) for phase
+            // 2, plus the quiet-line drain's cap (quietMs + QUIET_DRAIN_CAP_MS,
+            // see readStatusResponse), plus another 5s because the write of
+            // the request itself could theoretically block too. Computed in
+            // long so large caller-supplied values can't overflow it.
+            final long guardTimeoutMs = (long) timeoutMs
+                    + (long) maxBytes * ((long) graceMs + READ_POLL_MS)
+                    + (long) quietMs + QUIET_DRAIN_CAP_MS + 5000L;
+            final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
+                if (completed.compareAndSet(false, true)) {
+                    disconnect();
+                    postError(result, "job_timeout", "Timed out while querying printer status");
+                }
+            }, guardTimeoutMs, TimeUnit.MILLISECONDS);
+
+            try {
+                final byte[] response = readStatusResponse(request, timeoutMs, graceMs, quietMs, maxBytes);
+
+                if (completed.compareAndSet(false, true)) {
+                    // An empty array is a legitimate result - it means the
+                    // printer did not answer in time - and is not an error,
+                    // so it must not trigger a disconnect.
+                    postSuccess(result, response);
+                }
+            } catch (IOException e) {
+                if (completed.compareAndSet(false, true)) {
+                    // The socket is unusable after a failed read/write, same
+                    // reasoning as writeData.
+                    disconnect();
+                    postError(result, classifyWriteError(e), e.getMessage() != null ? e.getMessage() : "Query failed");
+                }
+            } finally {
+                timeoutFuture.cancel(true);
+            }
+        });
+    }
+
+    private byte[] readStatusResponse(byte[] request, int timeoutMs, int graceMs, int quietMs, int maxBytes) throws IOException {
+        final InputStream inputStream;
+        final OutputStream outputStream;
+        synchronized (connectionLock) {
+            if (!connected || activeSocket == null || activeInputStream == null || activeOutputStream == null) {
+                throw new IOException("Printer disconnected");
+            }
+            inputStream = activeInputStream;
+            outputStream = activeOutputStream;
+        }
+
+        // Drain whatever is already sitting in the input buffer before asking
+        // our own question. The printer can push an unsolicited ASB packet on
+        // its own, without being asked, and if we didn't drain it here we
+        // could mistake it for the answer to this query.
+        //
+        // This is a mitigation, not a fix: ESC/POS replies carry no tag
+        // saying which request they answer, so pairing a reply to its
+        // request is fundamentally the caller's job (it knows which fixed
+        // bits to expect back). If the PREVIOUS query timed out in phase 1
+        // without a single byte, its answer may still be in flight and
+        // land mid-drain or mid-send of this one - a plain "stop once
+        // available() == 0" drain would miss it. In that case we instead
+        // wait for the line to go quiet for quietMs, capped overall at
+        // quietMs + QUIET_DRAIN_CAP_MS so a printer that stays chatty can't
+        // stall this query forever. The cap is quietMs + the base allowance
+        // (not just the base) so a requested quietPeriod above 1 s can still
+        // elapse: the line gets up to QUIET_DRAIN_CAP_MS of chatter, then the
+        // full quietMs of silence must fit inside the cap.
+        int discarded = 0;
+        final byte[] drainBuffer = new byte[64];
+        if (previousStatusQueryUnanswered) {
+            final long drainCapNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos((long) quietMs + QUIET_DRAIN_CAP_MS);
+            long quietSinceNanos = System.nanoTime();
+            while (System.nanoTime() < drainCapNanos) {
+                if (inputStream.available() > 0) {
+                    final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
+                    if (read <= 0) {
+                        break;
+                    }
+                    discarded += read;
+                    quietSinceNanos = System.nanoTime();
+                } else if (System.nanoTime() - quietSinceNanos >= TimeUnit.MILLISECONDS.toNanos(quietMs)) {
+                    break;
+                } else {
+                    sleepQuietly(READ_POLL_MS);
+                }
+            }
+            if (discarded > 0) {
+                Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input while waiting for a quiet line after an unanswered query");
+            }
+        } else {
+            while (inputStream.available() > 0) {
+                final int read = inputStream.read(drainBuffer, 0, Math.min(drainBuffer.length, inputStream.available()));
+                if (read <= 0) {
+                    break;
+                }
+                discarded += read;
+            }
+            if (discarded > 0) {
+                Log.d(TAG, "Discarded " + discarded + " stale byte(s) from printer input before status query");
+            }
+        }
+
+        outputStream.write(request);
+        outputStream.flush();
+
+        // maxBytes is validated (1..MAX_STATUS_RESPONSE_BYTES) in
+        // queryStatus before this runs, so this allocation is bounded.
+        final byte[] buffer = new byte[maxBytes];
+        int received = 0;
+
+        // Phase 1: wait for the FIRST byte, up to timeoutMs. DLE EOT answers
+        // from the printer's interrupt routine, so a healthy printer clears
+        // this almost instantly; a queued GS r can take the whole timeout,
+        // since it only answers once the printer works through everything
+        // already ahead of it in the buffer.
+        final long firstByteDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (received == 0 && received < buffer.length) {
+            if (inputStream.available() > 0) {
+                final int toRead = Math.min(inputStream.available(), buffer.length - received);
+                final int read = inputStream.read(buffer, received, toRead);
+                if (read <= 0) {
+                    break;
+                }
+                received += read;
+            } else if (System.nanoTime() >= firstByteDeadlineNanos) {
+                // The deadline is only declared once there is genuinely
+                // nothing to read: a reply that lands during the final poll
+                // sleep still counts as inside the promised timeout.
+                break;
+            } else {
+                // Poll instead of a blocking read(): BluetoothSocket's input
+                // stream has no read timeout, so a blocking read() here would
+                // stall this thread until the connection itself dies.
+                sleepQuietly(READ_POLL_MS);
+            }
+        }
+
+        // Phase 2: once the first byte has landed, keep collecting up to
+        // maxBytes, but only for graceMs after the LAST byte received - not
+        // the rest of timeoutMs. Without this, a one-byte DLE EOT reply
+        // would block the call for the full (multi-second) timeout callers
+        // use for queued GS r requests, even though the printer already
+        // answered.
+        if (received > 0) {
+            long graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
+            while (received < buffer.length) {
+                if (inputStream.available() > 0) {
+                    final int toRead = Math.min(inputStream.available(), buffer.length - received);
+                    final int read = inputStream.read(buffer, received, toRead);
+                    if (read <= 0) {
+                        break;
+                    }
+                    received += read;
+                    graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
+                } else if (System.nanoTime() >= graceDeadlineNanos) {
+                    // Same ordering as phase 1: the grace window only expires
+                    // when there is genuinely nothing left to read, so a byte
+                    // that lands during the last poll sleep still renews it.
+                    break;
+                } else {
+                    sleepQuietly(READ_POLL_MS);
+                }
+            }
+        }
+
+        // Remember whether this query got any bytes at all, so the NEXT
+        // query knows whether a stale reply might still be in flight.
+        previousStatusQueryUnanswered = received == 0;
+
+        if (received == buffer.length) {
+            return buffer;
+        }
+        final byte[] trimmed = new byte[received];
+        System.arraycopy(buffer, 0, trimmed, 0, received);
+        return trimmed;
+    }
+
+    private int toIntArg(Object value) {
+        return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
+    private long toLongArg(Object value) {
+        return value instanceof Number ? ((Number) value).longValue() : 0;
+    }
+
     private byte[] toByteArray(Object bytesValue) {
-        if (!(bytesValue instanceof ArrayList)) {
+        // StandardMessageCodec decodes a Dart Uint8List argument as a raw
+        // byte[] on Android (not an ArrayList), and Int32List/Int64List as
+        // int[]/long[]; without handling those, a caller passing a typed
+        // list (e.g. Uint8List.fromList(...)) silently produced bytes_empty.
+        if (bytesValue instanceof byte[]) {
+            return Arrays.copyOf((byte[]) bytesValue, ((byte[]) bytesValue).length);
+        }
+
+        if (bytesValue instanceof int[]) {
+            final int[] ints = (int[]) bytesValue;
+            final byte[] data = new byte[ints.length];
+            for (int i = 0; i < ints.length; i++) {
+                data[i] = (byte) (ints[i] & 0xFF);
+            }
+            return data;
+        }
+
+        if (bytesValue instanceof long[]) {
+            final long[] longs = (long[]) bytesValue;
+            final byte[] data = new byte[longs.length];
+            for (int i = 0; i < longs.length; i++) {
+                data[i] = (byte) (longs[i] & 0xFF);
+            }
+            return data;
+        }
+
+        if (!(bytesValue instanceof List)) {
             return new byte[0];
         }
 
-        final ArrayList<?> list = (ArrayList<?>) bytesValue;
+        final List<?> list = (List<?>) bytesValue;
         final byte[] data = new byte[list.size()];
         for (int i = 0; i < list.size(); i++) {
             final Object item = list.get(i);
@@ -663,7 +957,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         closeSocket(activeSocket);
         activeSocket = null;
         activeOutputStream = null;
+        activeInputStream = null;
         connected = false;
+        previousStatusQueryUnanswered = false;
     }
 
     private void sleepQuietly(long millis) {

@@ -12,6 +12,17 @@ class BluetoothManager {
   static const int CONNECTED = 1;
   static const int DISCONNECTED = 0;
 
+  /// Hard ceiling for [queryStatus]'s `maxBytes`. Real ESC/POS status
+  /// replies are a handful of bytes, so this is not a protocol limit - the
+  /// native side allocates the response buffer up front, and the cap only
+  /// keeps a wild value from turning into a huge allocation there.
+  static const int MAX_STATUS_RESPONSE_BYTES = 64 * 1024;
+
+  /// Largest millisecond value [queryStatus] durations may take. The
+  /// Android side stores them in an `int`; anything above this would arrive
+  /// as a Long and be rejected there anyway.
+  static const int MAX_DURATION_MS = 0x7fffffff;
+
   static const MethodChannel _channel =
       const MethodChannel('$NAMESPACE/methods');
   static const EventChannel _stateChannel =
@@ -150,5 +161,83 @@ class BluetoothManager {
     };
 
     return await _invokeMethod('writeData', args) ?? true;
+  }
+
+  /// Sends [request] to the printer and returns whatever it writes back.
+  ///
+  /// [timeout] is the deadline for the FIRST byte of the reply to arrive.
+  /// Once at least one byte has been received, collection keeps going for
+  /// up to [grace] after the last byte received - not the rest of
+  /// [timeout] - or until [maxBytes] have been read, whichever comes
+  /// first. This keeps a one-byte reply fast even when [timeout] is set
+  /// high for a queued command.
+  ///
+  /// An empty result means the printer did not answer within [timeout] -
+  /// that is a normal outcome, not an error.
+  ///
+  /// [timeout]'s default of 600ms is enough for a real-time query such as
+  /// `DLE EOT`, since the printer answers from its interrupt routine
+  /// immediately. Callers MUST raise it to several seconds for a queued
+  /// query such as `GS r`, whose answer only arrives after the printer has
+  /// worked through everything already sitting in its buffer.
+  ///
+  /// [quietPeriod] is a best-effort MITIGATION for a limitation of ESC/POS
+  /// itself, not a fix: a reply carries no tag saying which request it
+  /// answers. If the previous call to [queryStatus] timed out without any
+  /// reply, its answer may still be in flight when this call sends its own
+  /// request; the native side then waits for the serial line to go quiet
+  /// for [quietPeriod] before sending, instead of trusting the first gap in
+  /// incoming bytes, so that stale reply gets drained instead of being
+  /// mistaken for this call's answer. This narrows the window for
+  /// mis-pairing a reply with the wrong request - it does not close it.
+  /// Matching a reply to the request it actually answers by its fixed bits
+  /// is the caller's responsibility, since only the caller knows which
+  /// command it sent.
+  ///
+  /// Throws an [ArgumentError] - before the platform channel is ever
+  /// invoked - if [request] is empty, if [maxBytes] is not between 1 and
+  /// [MAX_STATUS_RESPONSE_BYTES], or if any of [timeout], [grace],
+  /// [quietPeriod] is negative or exceeds [MAX_DURATION_MS] milliseconds.
+  Future<Uint8List> queryStatus(
+    final List<int> request, {
+    final Duration timeout = const Duration(milliseconds: 600),
+    final Duration grace = const Duration(milliseconds: 50),
+    final Duration quietPeriod = const Duration(milliseconds: 150),
+    final int maxBytes = 16,
+  }) async {
+    if (request.isEmpty) {
+      throw ArgumentError.value(request, 'request', 'must not be empty');
+    }
+    if (maxBytes <= 0 || maxBytes > MAX_STATUS_RESPONSE_BYTES) {
+      throw ArgumentError.value(maxBytes, 'maxBytes',
+          'must be between 1 and $MAX_STATUS_RESPONSE_BYTES');
+    }
+    // The Android side keeps these in an int - anything above
+    // MAX_DURATION_MS would arrive as a Long and be rejected there anyway,
+    // so the same bound is enforced here first.
+    if (timeout.isNegative || timeout.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          timeout, 'timeout', 'must be between 0 and $MAX_DURATION_MS ms');
+    }
+    if (grace.isNegative || grace.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          grace, 'grace', 'must be between 0 and $MAX_DURATION_MS ms');
+    }
+    if (quietPeriod.isNegative ||
+        quietPeriod.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          quietPeriod, 'quietPeriod', 'must be between 0 and $MAX_DURATION_MS ms');
+    }
+
+    final args = <String, Object>{
+      'bytes': request,
+      'timeoutMs': timeout.inMilliseconds,
+      'graceMs': grace.inMilliseconds,
+      'quietMs': quietPeriod.inMilliseconds,
+      'maxBytes': maxBytes,
+    };
+
+    final result = await _invokeMethod<Uint8List>('queryStatus', args);
+    return result ?? Uint8List(0);
   }
 }

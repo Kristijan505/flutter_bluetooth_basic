@@ -85,4 +85,12 @@ bool _isConnectMethod(final String method) =>
     method == 'connect' || method == 'startScan';
 
 bool _isWriteMethod(final String method) =>
-    method == 'writeData' || method == 'write' || method == 'printTicket';
+    method == 'writeData' ||
+    method == 'write' ||
+    method == 'printTicket' ||
+    // queryStatus runs on the same timeout-guarded job queue as writeData
+    // (see FlutterBluetoothBasicPlugin#queryStatus) and reports its own
+    // guard timeout as the literal 'job_timeout' code, so a bare 'timeout'
+    // from it should be treated the same way: as a job timeout, not a
+    // connection timeout.
+    method == 'queryStatus';
