@@ -487,6 +487,13 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                 final BluetoothSocket socket = createSocket(device);
                 socketRef.set(socket);
                 socket.connect();
+                // Both streams are acquired BEFORE completed is set: if the
+                // socket dies between connect() and here, these throw while
+                // completed is still false, so the catch below can still
+                // report the failure and clean up instead of leaving the
+                // Dart connect future pending forever.
+                final OutputStream outputStream = socket.getOutputStream();
+                final InputStream inputStream = socket.getInputStream();
 
                 if (!completed.compareAndSet(false, true)) {
                     closeSocket(socket);
@@ -495,8 +502,8 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
                 synchronized (connectionLock) {
                     activeSocket = socket;
-                    activeOutputStream = socket.getOutputStream();
-                    activeInputStream = socket.getInputStream();
+                    activeOutputStream = outputStream;
+                    activeInputStream = inputStream;
                     connectedAddress = address;
                     connected = true;
                     previousStatusQueryUnanswered = false;
@@ -630,14 +637,27 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
             return;
         }
 
-        final int timeoutMs = toIntArg(args.get("timeoutMs"));
-        final int graceMs = toIntArg(args.get("graceMs"));
-        final int quietMs = toIntArg(args.get("quietMs"));
+        // Durations are read as long first: a Dart Duration bigger than
+        // Integer.MAX_VALUE milliseconds (~24.8 days) arrives as a Long, and
+        // intValue() would silently wrap it negative - a wrapped timeout makes
+        // the guard fire immediately and disconnect a healthy printer.
+        final long timeoutMsArg = toLongArg(args.get("timeoutMs"));
+        final long graceMsArg = toLongArg(args.get("graceMs"));
+        final long quietMsArg = toLongArg(args.get("quietMs"));
         final int maxBytes = toIntArg(args.get("maxBytes"));
+        if (timeoutMsArg < 0 || timeoutMsArg > Integer.MAX_VALUE
+                || graceMsArg < 0 || graceMsArg > Integer.MAX_VALUE
+                || quietMsArg < 0 || quietMsArg > Integer.MAX_VALUE) {
+            result.error("invalid_args", "timeoutMs/graceMs/quietMs must be between 0 and " + Integer.MAX_VALUE, null);
+            return;
+        }
         if (maxBytes <= 0 || maxBytes > MAX_STATUS_RESPONSE_BYTES) {
             result.error("invalid_args", "maxBytes must be between 1 and " + MAX_STATUS_RESPONSE_BYTES, null);
             return;
         }
+        final int timeoutMs = (int) timeoutMsArg;
+        final int graceMs = (int) graceMsArg;
+        final int quietMs = (int) quietMsArg;
 
         // ioExecutor is a single-thread executor, so a status query can never
         // interrupt a print job that is already in flight - it simply queues
@@ -646,15 +666,21 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // in-progress write would corrupt both.
         ioExecutor.execute(() -> {
             final AtomicBoolean completed = new AtomicBoolean(false);
-            // Phase 2 (see readStatusResponse) can renew its graceMs window
-            // once per byte actually received, so in the worst case it
-            // renews up to maxBytes times - not just once. The guard timeout
-            // has to cover that whole worst case: timeoutMs for phase 1, plus
-            // maxBytes * graceMs for phase 2, plus QUIET_DRAIN_CAP_MS for the
-            // quiet-line drain, plus another 5s because the write of the
-            // request itself could theoretically block too. Computed in long
-            // so large caller-supplied values can't overflow it.
-            final long guardTimeoutMs = (long) timeoutMs + (long) maxBytes * (long) graceMs + QUIET_DRAIN_CAP_MS + 5000L;
+            // Phase 2 (see readStatusResponse) renews its graceMs window once
+            // per byte actually received, so in the worst case it renews up
+            // to maxBytes times. Each renewal can also overshoot its deadline
+            // by up to READ_POLL_MS - availability is polled, and a byte that
+            // lands during the final sleep is still accepted - so one renewal
+            // costs at most graceMs + READ_POLL_MS, not graceMs.
+            // The guard timeout has to cover that whole worst case: timeoutMs
+            // for phase 1, plus maxBytes * (graceMs + READ_POLL_MS) for phase
+            // 2, plus the quiet-line drain's cap (quietMs + QUIET_DRAIN_CAP_MS,
+            // see readStatusResponse), plus another 5s because the write of
+            // the request itself could theoretically block too. Computed in
+            // long so large caller-supplied values can't overflow it.
+            final long guardTimeoutMs = (long) timeoutMs
+                    + (long) maxBytes * ((long) graceMs + READ_POLL_MS)
+                    + (long) quietMs + QUIET_DRAIN_CAP_MS + 5000L;
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
                     disconnect();
@@ -708,12 +734,15 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // land mid-drain or mid-send of this one - a plain "stop once
         // available() == 0" drain would miss it. In that case we instead
         // wait for the line to go quiet for quietMs, capped overall at
-        // QUIET_DRAIN_CAP_MS so a printer that stays chatty can't stall
-        // this query forever.
+        // quietMs + QUIET_DRAIN_CAP_MS so a printer that stays chatty can't
+        // stall this query forever. The cap is quietMs + the base allowance
+        // (not just the base) so a requested quietPeriod above 1 s can still
+        // elapse: the line gets up to QUIET_DRAIN_CAP_MS of chatter, then the
+        // full quietMs of silence must fit inside the cap.
         int discarded = 0;
         final byte[] drainBuffer = new byte[64];
         if (previousStatusQueryUnanswered) {
-            final long drainCapNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(QUIET_DRAIN_CAP_MS);
+            final long drainCapNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos((long) quietMs + QUIET_DRAIN_CAP_MS);
             long quietSinceNanos = System.nanoTime();
             while (System.nanoTime() < drainCapNanos) {
                 if (inputStream.available() > 0) {
@@ -822,6 +851,10 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
 
     private int toIntArg(Object value) {
         return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
+    private long toLongArg(Object value) {
+        return value instanceof Number ? ((Number) value).longValue() : 0;
     }
 
     private byte[] toByteArray(Object bytesValue) {

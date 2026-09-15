@@ -18,6 +18,11 @@ class BluetoothManager {
   /// keeps a wild value from turning into a huge allocation there.
   static const int MAX_STATUS_RESPONSE_BYTES = 64 * 1024;
 
+  /// Largest millisecond value [queryStatus] durations may take. The
+  /// Android side stores them in an `int`; anything above this would arrive
+  /// as a Long and be rejected there anyway.
+  static const int MAX_DURATION_MS = 0x7fffffff;
+
   static const MethodChannel _channel =
       const MethodChannel('$NAMESPACE/methods');
   static const EventChannel _stateChannel =
@@ -192,7 +197,7 @@ class BluetoothManager {
   /// Throws an [ArgumentError] - before the platform channel is ever
   /// invoked - if [request] is empty, if [maxBytes] is not between 1 and
   /// [MAX_STATUS_RESPONSE_BYTES], or if any of [timeout], [grace],
-  /// [quietPeriod] is negative.
+  /// [quietPeriod] is negative or exceeds [MAX_DURATION_MS] milliseconds.
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
@@ -207,14 +212,21 @@ class BluetoothManager {
       throw ArgumentError.value(maxBytes, 'maxBytes',
           'must be between 1 and $MAX_STATUS_RESPONSE_BYTES');
     }
-    if (timeout.isNegative) {
-      throw ArgumentError.value(timeout, 'timeout', 'must not be negative');
+    // The Android side keeps these in an int - anything above
+    // MAX_DURATION_MS would arrive as a Long and be rejected there anyway,
+    // so the same bound is enforced here first.
+    if (timeout.isNegative || timeout.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          timeout, 'timeout', 'must be between 0 and $MAX_DURATION_MS ms');
     }
-    if (grace.isNegative) {
-      throw ArgumentError.value(grace, 'grace', 'must not be negative');
+    if (grace.isNegative || grace.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          grace, 'grace', 'must be between 0 and $MAX_DURATION_MS ms');
     }
-    if (quietPeriod.isNegative) {
-      throw ArgumentError.value(quietPeriod, 'quietPeriod', 'must not be negative');
+    if (quietPeriod.isNegative ||
+        quietPeriod.inMilliseconds > MAX_DURATION_MS) {
+      throw ArgumentError.value(
+          quietPeriod, 'quietPeriod', 'must be between 0 and $MAX_DURATION_MS ms');
     }
 
     final args = <String, Object>{

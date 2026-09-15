@@ -322,5 +322,33 @@ void main() {
       );
       expect(lastCall, isNull);
     });
+
+    test('rejects durations that overflow the native int without invoking the channel', () async {
+      // The Android side stores these in an int; a ~25-day Duration would
+      // arrive as a Long and wrap negative there - a wrapped timeout makes
+      // the guard fire immediately on a healthy printer.
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          timeout: const Duration(milliseconds: 0x80000000),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          grace: const Duration(milliseconds: 0x80000000),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          quietPeriod: const Duration(milliseconds: 0x80000000),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
   });
 }
