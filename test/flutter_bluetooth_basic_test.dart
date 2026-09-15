@@ -215,4 +215,55 @@ void main() {
       ),
     );
   });
+
+  group('queryStatus argument validation', () {
+    test('rejects an empty request without invoking the channel', () async {
+      await expectLater(
+        BluetoothManager.instance.queryStatus(<int>[]),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+
+    test('rejects a non-positive maxBytes without invoking the channel', () async {
+      await expectLater(
+        BluetoothManager.instance.queryStatus(<int>[0x10], maxBytes: 0),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+
+    test('rejects a negative timeout without invoking the channel', () async {
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          timeout: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+
+    test('rejects a negative grace without invoking the channel', () async {
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          grace: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+
+    test('rejects a negative quietPeriod without invoking the channel', () async {
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          quietPeriod: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+  });
 }

@@ -634,16 +634,21 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // in-progress write would corrupt both.
         ioExecutor.execute(() -> {
             final AtomicBoolean completed = new AtomicBoolean(false);
-            // The guard timeout pads timeoutMs + graceMs by QUIET_DRAIN_CAP_MS
-            // (the worst case for the quiet-line drain below) plus another 5s
-            // because the write of the request itself could theoretically
-            // block too.
+            // Phase 2 (see readStatusResponse) can renew its graceMs window
+            // once per byte actually received, so in the worst case it
+            // renews up to maxBytes times - not just once. The guard timeout
+            // has to cover that whole worst case: timeoutMs for phase 1, plus
+            // maxBytes * graceMs for phase 2, plus QUIET_DRAIN_CAP_MS for the
+            // quiet-line drain, plus another 5s because the write of the
+            // request itself could theoretically block too. Computed in long
+            // so large caller-supplied values can't overflow it.
+            final long guardTimeoutMs = (long) timeoutMs + (long) maxBytes * (long) graceMs + QUIET_DRAIN_CAP_MS + 5000L;
             final ScheduledFuture<?> timeoutFuture = timeoutExecutor.schedule(() -> {
                 if (completed.compareAndSet(false, true)) {
                     disconnect();
                     postError(result, "job_timeout", "Timed out while querying printer status");
                 }
-            }, timeoutMs + graceMs + QUIET_DRAIN_CAP_MS + 5000, TimeUnit.MILLISECONDS);
+            }, guardTimeoutMs, TimeUnit.MILLISECONDS);
 
             try {
                 final byte[] response = readStatusResponse(request, timeoutMs, graceMs, quietMs, maxBytes);

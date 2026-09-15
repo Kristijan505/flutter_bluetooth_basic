@@ -182,6 +182,10 @@ class BluetoothManager {
   /// Matching a reply to the request it actually answers by its fixed bits
   /// is the caller's responsibility, since only the caller knows which
   /// command it sent.
+  ///
+  /// Throws an [ArgumentError] - before the platform channel is ever
+  /// invoked - if [request] is empty, if [maxBytes] is not positive, or if
+  /// any of [timeout], [grace], [quietPeriod] is negative.
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
@@ -189,6 +193,22 @@ class BluetoothManager {
     final Duration quietPeriod = const Duration(milliseconds: 150),
     final int maxBytes = 16,
   }) async {
+    if (request.isEmpty) {
+      throw ArgumentError.value(request, 'request', 'must not be empty');
+    }
+    if (maxBytes <= 0) {
+      throw ArgumentError.value(maxBytes, 'maxBytes', 'must be positive');
+    }
+    if (timeout.isNegative) {
+      throw ArgumentError.value(timeout, 'timeout', 'must not be negative');
+    }
+    if (grace.isNegative) {
+      throw ArgumentError.value(grace, 'grace', 'must not be negative');
+    }
+    if (quietPeriod.isNegative) {
+      throw ArgumentError.value(quietPeriod, 'quietPeriod', 'must not be negative');
+    }
+
     final args = <String, Object>{
       'bytes': request,
       'timeoutMs': timeout.inMilliseconds,
