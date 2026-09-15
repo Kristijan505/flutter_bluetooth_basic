@@ -66,6 +66,12 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
     private static final long CHUNK_PAUSE_MS = 50L;
     private static final long READ_POLL_MS = 10L;
     private static final long QUIET_DRAIN_CAP_MS = 1000L;
+    // Hard ceiling for a status reply. Real ESC/POS replies are a handful of
+    // bytes, so this is not a protocol limit - it only keeps a wild caller
+    // value (e.g. 1_000_000_000) from turning into a ~1 GB allocation, which
+    // would surface as an OutOfMemoryError the IOException handler cannot
+    // catch and could kill the process.
+    private static final int MAX_STATUS_RESPONSE_BYTES = 64 * 1024;
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     private final Object connectionLock = new Object();
@@ -628,6 +634,10 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         final int graceMs = toIntArg(args.get("graceMs"));
         final int quietMs = toIntArg(args.get("quietMs"));
         final int maxBytes = toIntArg(args.get("maxBytes"));
+        if (maxBytes <= 0 || maxBytes > MAX_STATUS_RESPONSE_BYTES) {
+            result.error("invalid_args", "maxBytes must be between 1 and " + MAX_STATUS_RESPONSE_BYTES, null);
+            return;
+        }
 
         // ioExecutor is a single-thread executor, so a status query can never
         // interrupt a print job that is already in flight - it simply queues
@@ -738,7 +748,9 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         outputStream.write(request);
         outputStream.flush();
 
-        final byte[] buffer = new byte[Math.max(maxBytes, 0)];
+        // maxBytes is validated (1..MAX_STATUS_RESPONSE_BYTES) in
+        // queryStatus before this runs, so this allocation is bounded.
+        final byte[] buffer = new byte[maxBytes];
         int received = 0;
 
         // Phase 1: wait for the FIRST byte, up to timeoutMs. DLE EOT answers
@@ -747,13 +759,19 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // since it only answers once the printer works through everything
         // already ahead of it in the buffer.
         final long firstByteDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        while (received == 0 && received < buffer.length && System.nanoTime() < firstByteDeadlineNanos) {
+        while (received == 0 && received < buffer.length) {
             if (inputStream.available() > 0) {
                 final int toRead = Math.min(inputStream.available(), buffer.length - received);
                 final int read = inputStream.read(buffer, received, toRead);
-                if (read > 0) {
-                    received += read;
+                if (read <= 0) {
+                    break;
                 }
+                received += read;
+            } else if (System.nanoTime() >= firstByteDeadlineNanos) {
+                // The deadline is only declared once there is genuinely
+                // nothing to read: a reply that lands during the final poll
+                // sleep still counts as inside the promised timeout.
+                break;
             } else {
                 // Poll instead of a blocking read(): BluetoothSocket's input
                 // stream has no read timeout, so a blocking read() here would
@@ -770,7 +788,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
         // answered.
         if (received > 0) {
             long graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
-            while (received < buffer.length && System.nanoTime() < graceDeadlineNanos) {
+            while (received < buffer.length) {
                 if (inputStream.available() > 0) {
                     final int toRead = Math.min(inputStream.available(), buffer.length - received);
                     final int read = inputStream.read(buffer, received, toRead);
@@ -779,6 +797,11 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, MethodCallHan
                     }
                     received += read;
                     graceDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMs);
+                } else if (System.nanoTime() >= graceDeadlineNanos) {
+                    // Same ordering as phase 1: the grace window only expires
+                    // when there is genuinely nothing left to read, so a byte
+                    // that lands during the last poll sleep still renews it.
+                    break;
                 } else {
                     sleepQuietly(READ_POLL_MS);
                 }

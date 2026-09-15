@@ -276,6 +276,20 @@ void main() {
       expect(lastCall, isNull);
     });
 
+    test('rejects an oversized maxBytes without invoking the channel', () async {
+      // The native side allocates the response buffer up front, so a wild
+      // value (e.g. 1 GB) would surface as an uncatchable OutOfMemoryError
+      // there - the cap rejects it here instead.
+      await expectLater(
+        BluetoothManager.instance.queryStatus(
+          <int>[0x10],
+          maxBytes: BluetoothManager.MAX_STATUS_RESPONSE_BYTES + 1,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(lastCall, isNull);
+    });
+
     test('rejects a negative timeout without invoking the channel', () async {
       await expectLater(
         BluetoothManager.instance.queryStatus(

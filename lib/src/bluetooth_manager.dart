@@ -12,6 +12,12 @@ class BluetoothManager {
   static const int CONNECTED = 1;
   static const int DISCONNECTED = 0;
 
+  /// Hard ceiling for [queryStatus]'s `maxBytes`. Real ESC/POS status
+  /// replies are a handful of bytes, so this is not a protocol limit - the
+  /// native side allocates the response buffer up front, and the cap only
+  /// keeps a wild value from turning into a huge allocation there.
+  static const int MAX_STATUS_RESPONSE_BYTES = 64 * 1024;
+
   static const MethodChannel _channel =
       const MethodChannel('$NAMESPACE/methods');
   static const EventChannel _stateChannel =
@@ -184,8 +190,9 @@ class BluetoothManager {
   /// command it sent.
   ///
   /// Throws an [ArgumentError] - before the platform channel is ever
-  /// invoked - if [request] is empty, if [maxBytes] is not positive, or if
-  /// any of [timeout], [grace], [quietPeriod] is negative.
+  /// invoked - if [request] is empty, if [maxBytes] is not between 1 and
+  /// [MAX_STATUS_RESPONSE_BYTES], or if any of [timeout], [grace],
+  /// [quietPeriod] is negative.
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
@@ -196,8 +203,9 @@ class BluetoothManager {
     if (request.isEmpty) {
       throw ArgumentError.value(request, 'request', 'must not be empty');
     }
-    if (maxBytes <= 0) {
-      throw ArgumentError.value(maxBytes, 'maxBytes', 'must be positive');
+    if (maxBytes <= 0 || maxBytes > MAX_STATUS_RESPONSE_BYTES) {
+      throw ArgumentError.value(maxBytes, 'maxBytes',
+          'must be between 1 and $MAX_STATUS_RESPONSE_BYTES');
     }
     if (timeout.isNegative) {
       throw ArgumentError.value(timeout, 'timeout', 'must not be negative');
