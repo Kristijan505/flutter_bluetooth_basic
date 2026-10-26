@@ -79,8 +79,9 @@ static BOOL BTSamePeripheral(CBPeripheral *first, CBPeripheral *second) {
 // next print job connects right after disconnect returns, so returning
 // earlier would start that connect while the printer is still disconnecting.
 @property(nonatomic, strong) NSMutableArray<FlutterResult> *pendingDisconnectResults;
-// The peripheral whose cancelPeripheralConnection is still in flight. Kept
-// apart from activePeripheral, which the disconnect clears right away.
+// The peripheral whose cancelPeripheralConnection is still in flight, for at
+// most the 2 s disconnectTimeoutTimer. Kept apart from activePeripheral,
+// which the disconnect clears right away.
 @property(nonatomic, strong) CBPeripheral *disconnectingPeripheral;
 @property(nonatomic) NSUInteger currentWriteChunkIndex;
 @property(nonatomic) CBCharacteristicWriteType currentWriteType;
@@ -274,6 +275,13 @@ didDiscoverPeripheral:(CBPeripheral *)peripheral
 - (void)centralManager:(CBCentralManager *)central
 didFailToConnectPeripheral:(CBPeripheral *)peripheral
                    error:(NSError *)error {
+  // iOS may report the cancel of a connection that was still pending here
+  // instead of in didDisconnectPeripheral, so it releases the waiting
+  // disconnect calls too.
+  if (BTSamePeripheral(peripheral, self.disconnectingPeripheral)) {
+    [self completePendingDisconnects];
+  }
+
   // A late failure for a peripheral we no longer try to connect to must not
   // fail the connect that replaced it.
   if (self.pendingConnectPeripheral != nil &&
@@ -382,7 +390,12 @@ didDiscoverCharacteristicsForService:(CBService *)service
 - (void)peripheral:(CBPeripheral *)peripheral
 didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
                         error:(NSError *)error {
-  if (!self.writeInProgress) {
+  // Only acknowledgements of the current job's writes may advance or fail
+  // it, not a late one from an earlier link or another characteristic.
+  if (!self.writeInProgress || !BTSamePeripheral(peripheral, self.activePeripheral) ||
+      self.writeCharacteristic == nil ||
+      (characteristic != self.writeCharacteristic &&
+       ![characteristic.UUID isEqual:self.writeCharacteristic.UUID])) {
     return;
   }
 
@@ -402,7 +415,8 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
 }
 
 - (void)peripheralIsReadyToSendWriteWithoutResponse:(CBPeripheral *)peripheral {
-  if (!self.writeInProgress || self.currentWriteType != CBCharacteristicWriteWithoutResponse) {
+  if (!self.writeInProgress || self.currentWriteType != CBCharacteristicWriteWithoutResponse ||
+      !BTSamePeripheral(peripheral, self.activePeripheral)) {
     return;
   }
 
@@ -482,6 +496,7 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
       !BTSamePeripheral(previousPeripheral, peripheral)) {
     if (state == CBManagerStatePoweredOn) {
       [self.centralManager cancelPeripheralConnection:previousPeripheral];
+      [self trackDisconnectingPeripheral:previousPeripheral];
     }
     if (BTSamePeripheral(self.activePeripheral, previousPeripheral)) {
       self.activePeripheral = nil;
@@ -612,7 +627,22 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
 
   if (self.activePeripheral != nil &&
       ![self.activePeripheral.identifier.UUIDString isEqualToString:peripheral.identifier.UUIDString]) {
-    [self.centralManager cancelPeripheralConnection:self.activePeripheral];
+    CBPeripheral *previousPeripheral = self.activePeripheral;
+    BOOL wasReady = self.connectionReady;
+    [self.centralManager cancelPeripheralConnection:previousPeripheral];
+    // Dropped as activePeripheral, so its didDisconnectPeripheral is ignored
+    // instead of failing this connect. That callback therefore no longer
+    // ends a write still running on it or reports the lost link, so both
+    // happen here.
+    self.activePeripheral = nil;
+    [self trackDisconnectingPeripheral:previousPeripheral];
+    [self completeCurrentWriteWithError:BTError(BTErrorDeviceDisconnected,
+                                                @"Printer disconnected.",
+                                                nil)
+                             disconnect:NO];
+    if (wasReady) {
+      [self emitState:@0];
+    }
   }
 
   self.connectionReady = NO;
@@ -782,7 +812,7 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
     [self.centralManager cancelPeripheralConnection:pendingPeripheral];
     // The Dart side disconnects after a failed connect; that call finds no
     // active peripheral any more but must still wait for this cancel.
-    self.disconnectingPeripheral = pendingPeripheral;
+    [self trackDisconnectingPeripheral:pendingPeripheral];
   }
 
   NSLog(@"Bluetooth connection failed (%@): %@", code, message);
@@ -884,9 +914,19 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
   }
 
   [self.pendingDisconnectResults addObject:[result copy]];
+  // Normally already armed by trackDisconnectingPeripheral:.
   if (self.disconnectTimeoutTimer == nil) {
     [self scheduleDisconnectTimeout];
   }
+}
+
+// Records a cancel in flight and (re)arms the 2 s cap at once, not only when
+// a Dart disconnect starts waiting: a cancel that is never confirmed then
+// expires, instead of making a later, unrelated disconnect wait for it.
+- (void)trackDisconnectingPeripheral:(CBPeripheral *)peripheral {
+  self.disconnectingPeripheral = peripheral;
+  [self cancelDisconnectTimeout];
+  [self scheduleDisconnectTimeout];
 }
 
 - (void)completePendingDisconnects {
@@ -914,7 +954,8 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
       return;
     }
     // A cancel may never be confirmed (e.g. for a connection that was still
-    // pending), so the wait is capped rather than left to hang.
+    // pending), so the wait is capped rather than left to hang. With nobody
+    // waiting this just forgets disconnectingPeripheral.
     [strongSelf completePendingDisconnects];
   });
   self.disconnectTimeoutTimer = timer;
@@ -960,7 +1001,7 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
   if (targetPeripheral != nil &&
       self.centralManager.state == CBManagerStatePoweredOn) {
     [self.centralManager cancelPeripheralConnection:targetPeripheral];
-    self.disconnectingPeripheral = targetPeripheral;
+    [self trackDisconnectingPeripheral:targetPeripheral];
   }
 
   [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
