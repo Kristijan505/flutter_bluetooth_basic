@@ -17,6 +17,7 @@ static NSString *const BTErrorConnectTimeout = @"connect_timeout";
 static NSString *const BTErrorWriteFailed = @"write_failed";
 static NSString *const BTErrorDeviceDisconnected = @"device_disconnected";
 static NSString *const BTErrorJobTimeout = @"job_timeout";
+static NSString *const BTErrorBluetoothUnavailable = @"bluetooth_unavailable";
 
 static NSArray<NSString *> *BTPreferredWriteCharacteristicUUIDs(void) {
   static NSArray<NSString *> *uuids;
@@ -60,6 +61,11 @@ static FlutterError *BTError(NSString *code, NSString *message, id details) {
 @property(nonatomic, strong) NSData *currentWritePayload;
 @property(nonatomic, strong) NSArray<NSData *> *currentWriteChunks;
 @property(nonatomic, copy) void (^currentWriteCompletion)(FlutterError *error);
+// Result of the Dart `connect` call, held until the link can actually take
+// writes (or fails). Callers send writeData as soon as connect completes, the
+// same contract as on Android, so completing it any earlier makes the first
+// write hit a link that is not ready yet.
+@property(nonatomic, copy) FlutterResult pendingConnectResult;
 @property(nonatomic) NSUInteger currentWriteChunkIndex;
 @property(nonatomic) CBCharacteristicWriteType currentWriteType;
 @property(nonatomic) BOOL scanRequested;
@@ -243,7 +249,18 @@ didDiscoverPeripheral:(CBPeripheral *)peripheral
 - (void)centralManager:(CBCentralManager *)central
 didFailToConnectPeripheral:(CBPeripheral *)peripheral
                    error:(NSError *)error {
+  // A late failure for a peripheral we no longer try to connect to must not
+  // fail the connect that replaced it.
+  if (self.pendingConnectPeripheral != nil &&
+      self.pendingConnectPeripheral != peripheral &&
+      ![self.pendingConnectPeripheral.identifier.UUIDString isEqualToString:peripheral.identifier.UUIDString]) {
+    return;
+  }
+
   [self cancelConnectTimeout];
+  [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
+                                            @"Failed to connect to peripheral.",
+                                            error.localizedDescription ?: [NSNull null])];
   [self clearConnectionState];
   [self emitState:@0];
 }
@@ -256,8 +273,20 @@ didFailToConnectPeripheral:(CBPeripheral *)peripheral
     return;
   }
 
+  // Before didConnectPeripheral (no activePeripheral yet) a pending connect
+  // cannot be disconnected - a failed attempt arrives as
+  // didFailToConnectPeripheral. A disconnect here is the late callback of an
+  // earlier cancelPeripheralConnection, e.g. the previous print job's
+  // disconnect, and must not fail the connect that follows it.
+  if (self.activePeripheral == nil && self.pendingConnectPeripheral != nil) {
+    return;
+  }
+
   [self cancelConnectTimeout];
   [self cancelWriteTimeout];
+  [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
+                                            @"Peripheral disconnected.",
+                                            error.localizedDescription ?: [NSNull null])];
   [self completeCurrentWriteWithError:BTError(BTErrorDeviceDisconnected,
                                               @"Peripheral disconnected.",
                                               error.localizedDescription ?: [NSNull null])
@@ -361,7 +390,32 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
     return;
   }
 
+  // Unknown and Resetting are transient: the connect waits for
+  // centralManagerDidUpdateState and the connect timeout covers it.
+  CBManagerState state = self.centralManager.state;
+  if (state == CBManagerStatePoweredOff) {
+    result(BTError(BTErrorBluetoothUnavailable, @"Bluetooth is not powered on.", nil));
+    return;
+  }
+  if (state == CBManagerStateUnauthorized) {
+    result(BTError(BTErrorBluetoothUnavailable, @"Bluetooth permission was denied.", nil));
+    return;
+  }
+  if (state == CBManagerStateUnsupported) {
+    result(BTError(BTErrorBluetoothUnavailable, @"Bluetooth is not supported.", nil));
+    return;
+  }
+
   CBPeripheral *peripheral = self.scannedPeripherals[address];
+  if (peripheral == nil && state == CBManagerStatePoweredOn) {
+    // Like Android, which connects by address alone: a printer the app
+    // remembers stays reachable after a later scan cleared
+    // scannedPeripherals. The address is the peripheral identifier.
+    NSUUID *identifier = [[NSUUID alloc] initWithUUIDString:address];
+    if (identifier != nil) {
+      peripheral = [self.centralManager retrievePeripheralsWithIdentifiers:@[ identifier ]].firstObject;
+    }
+  }
   if (peripheral == nil) {
     result(BTError(BTErrorDeviceDisconnected,
                    @"Device was not found in the current scan results.",
@@ -369,16 +423,40 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
     return;
   }
 
+  [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
+                                            @"Superseded by a new connect request.",
+                                            nil)];
+
+  // Completed only once the link can take writes (see pendingConnectResult),
+  // or with an error by the connect timeout or a failure callback.
+  self.pendingConnectResult = result;
   self.connectRequested = YES;
   self.pendingConnectPeripheral = peripheral;
   [self cancelConnectTimeout];
   [self scheduleConnectTimeout];
 
-  if (self.centralManager.state == CBManagerStatePoweredOn) {
+  if (state == CBManagerStatePoweredOn) {
     [self startConnectionToPeripheral:peripheral];
   }
+}
 
-  result(nil);
+- (void)completePendingConnectWithValue:(id)value {
+  FlutterResult result = self.pendingConnectResult;
+  if (result == nil) {
+    return;
+  }
+  // Cleared before calling so that nothing can complete it a second time.
+  self.pendingConnectResult = nil;
+  result(value);
+}
+
+- (void)failPendingConnectWithError:(FlutterError *)error {
+  FlutterResult result = self.pendingConnectResult;
+  if (result == nil) {
+    return;
+  }
+  self.pendingConnectResult = nil;
+  result(error);
 }
 
 - (void)writeDataWithArguments:(NSDictionary *)args result:(FlutterResult)result {
@@ -538,6 +616,8 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
   self.connectRequested = NO;
   [self cancelConnectTimeout];
   [self emitState:@1];
+  // Android completes connect with true once its socket is usable.
+  [self completePendingConnectWithValue:@YES];
 }
 
 - (BOOL)isWritableCharacteristic:(CBCharacteristic *)characteristic {
@@ -559,7 +639,12 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
     return 20;
   }
 
-  NSUInteger maxLength = [self.activePeripheral maximumWriteValueLengthForType:self.currentWriteType];
+  // The without-response limit (ATT MTU - 3) is used for both write types.
+  // For writes with response iOS reports up to 512 bytes and sends anything
+  // above the MTU as an ATT long write (prepare/execute), which many cheap
+  // thermal-printer BLE modules do not support.
+  NSUInteger maxLength =
+      [self.activePeripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse];
   return maxLength > 0 ? maxLength : 20;
 }
 
@@ -620,6 +705,7 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
                        message:(NSString *)message
                        details:(id)details {
   [self cancelConnectTimeout];
+  [self failPendingConnectWithError:BTError(code, message, details)];
   CBPeripheral *pendingPeripheral = self.activePeripheral ?: self.pendingConnectPeripheral;
   [self clearConnectionState];
   [self emitState:@0];
@@ -632,6 +718,11 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
 }
 
 - (void)clearConnectionState {
+  // Safety net so the Dart connect future can never hang. Every caller sends
+  // its own, more specific error first; this only fires if one does not.
+  [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
+                                            @"Connection was closed before it became ready.",
+                                            nil)];
   self.connectRequested = NO;
   self.connectionReady = NO;
   self.activePeripheral = nil;
@@ -745,6 +836,9 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
     [self.centralManager cancelPeripheralConnection:targetPeripheral];
   }
 
+  [self failPendingConnectWithError:BTError(BTErrorDeviceDisconnected,
+                                            @"Printer disconnected.",
+                                            nil)];
   [self completeCurrentWriteWithError:BTError(BTErrorDeviceDisconnected,
                                               @"Printer disconnected.",
                                               nil)
